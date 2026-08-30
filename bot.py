@@ -2,7 +2,7 @@ import time
 import random
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ---- CONFIG (set these as Railway environment variables) ----
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://jcwvfgiudhzdpmqibwji.supabase.co")
@@ -153,17 +153,30 @@ def save_alert(user_id, alert_type, title, description):
 
 # ---- SAVE SETTINGS ----
 def save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leverage, risk):
-    supa_upsert("bot_settings", {
-        "user_id": user_id,
-        "balance_cad": round(balance, 4),
-        "total_pnl_cad": round(total_pnl, 4),
-        "trade_count": trade_count,
-        "trade_size_pct": trade_size_pct,
-        "leverage": leverage,
-        "risk": risk,
-        "bot_enabled": True,
-        "updated_at": datetime.utcnow().isoformat()
-    })
+    # Try PATCH first (update existing row)
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/bot_settings?user_id=eq.{user_id}",
+        json={
+            "balance_cad": round(balance, 4),
+            "total_pnl_cad": round(total_pnl, 4),
+            "trade_count": trade_count,
+            "trade_size_pct": trade_size_pct,
+            "leverage": leverage,
+            "risk": risk,
+            "bot_enabled": True,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        },
+        headers={
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+    )
+    if r.ok:
+        log(f"  Settings saved — balance: ${balance:.2f} CAD")
+    else:
+        log(f"  Settings save failed: {r.status_code} {r.text}")
 
 # ---- RUN ONE SCAN FOR ONE USER ----
 def scan_for_user(user, prices):
