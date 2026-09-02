@@ -126,7 +126,11 @@ Respond ONLY in JSON, no other text:
             },
             timeout=15
         )
-        text = r.json()["content"][0]["text"]
+        resp = r.json()
+        if "error" in resp:
+            log(f"  Claude API error: {resp['error']}")
+            return {"trade": False, "side": "long", "confidence": "low", "reason": "API error, skipping."}
+        text = resp["content"][0]["text"]
         text = text.replace("```json", "").replace("```", "").strip()
         result = json.loads(text)
         log(f"  Claude: trade={result.get('trade')} side={result.get('side')} conf={result.get('confidence')}")
