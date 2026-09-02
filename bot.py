@@ -97,20 +97,18 @@ def call_claude(market, price, price_str, risk, leverage):
             "reason": f"Fallback logic — no AI key set."
         }
     try:
-        prompt = f"""You are a crypto trading bot making real paper trading decisions.
+        prompt = f"""You are a crypto paper trading bot. Make a quick trading decision.
+
 Market: {market}
 Current price: {price_str}
 Risk level: {risk}
 Leverage: {leverage}x
 
-Analyze whether to trade right now based on:
-- Is this a good entry point given the current price?
-- What direction makes more sense (long = buy, short = sell)?
-- How confident are you?
+You must make a decision — either trade or skip. Be willing to trade when conditions seem reasonable.
+Consider: Is this a major crypto with good liquidity? Does the price seem like a reasonable entry?
 
-Be conservative — only trade when there is a clear signal. Skip most trades.
 Respond ONLY in JSON, no other text:
-{{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "one sentence explanation"}}"""
+{{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "one sentence"}}"""
 
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
