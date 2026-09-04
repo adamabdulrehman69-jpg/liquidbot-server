@@ -3,8 +3,26 @@ import random
 import requests
 import os
 import json
+import threading
 from datetime import datetime, timezone
 from collections import defaultdict
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ---- KEEP-ALIVE WEB SERVER (prevents Railway from sleeping) ----
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'LiquidBot is running OK')
+    def log_message(self, format, *args):
+        pass  # suppress HTTP logs
+
+def start_keep_alive():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), KeepAliveHandler)
+    log(f"   Keep-alive server running on port {port}")
+    server.serve_forever()
 
 # ---- CONFIG ----
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://jcwvfgiudhzdpmqibwji.supabase.co")
@@ -583,6 +601,10 @@ def main():
     log(f"   Stop loss: {STOP_LOSS_PCT*100:.1f}% | Take profit: {TAKE_PROFIT_PCT*100:.1f}% | Hard stop: ${HARD_STOP_BALANCE}")
     log(f"   Self-learning: every {LEARN_EVERY} scans")
     log(f"   Mode: RSI + SMA + Volume + Funding + Order Book + Self Learning 🧠")
+
+    # Start keep-alive web server in background thread
+    t = threading.Thread(target=start_keep_alive, daemon=True)
+    t.start()
     log("")
 
     consecutive_errors = 0
