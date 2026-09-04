@@ -332,19 +332,31 @@ Respond ONLY in JSON, no other text:
         log(f"  Claude error: {e}")
         return {"trade": False, "side": "long", "confidence": "low", "reason": "AI error, skipping."}
 
-# ---- SIMULATE REALISTIC P&L ----
-def simulate_pnl(size_cad, leverage, confidence):
+# ---- STOP LOSS / TAKE PROFIT / HARD STOP ----
+STOP_LOSS_PCT = 0.025       # 2.5% loss on notional = stop loss triggers
+TAKE_PROFIT_PCT = 0.035     # 3.5% gain on notional = take profit triggers
+HARD_STOP_BALANCE = 80.0    # stop all trading if balance drops below $80 CAD
+
+def simulate_pnl(size_cad, leverage, confidence, balance):
+    """Simulate P&L with stop loss and take profit logic"""
     notional = size_cad * leverage
     fee_cost = notional * TRADING_FEE * 2
     slippage_cost = notional * SLIPPAGE
+
     win_prob = 0.57 if confidence == "high" else 0.51 if confidence == "medium" else 0.43
     won = random.random() < win_prob
+
     if won:
-        gross_pnl = notional * random.uniform(0.003, 0.018)
+        # Take profit hits — capped at TAKE_PROFIT_PCT
+        gross_pnl = notional * random.uniform(0.005, TAKE_PROFIT_PCT)
+        exit_reason = "take profit"
     else:
-        gross_pnl = -notional * random.uniform(0.003, 0.014)
+        # Stop loss hits — capped at STOP_LOSS_PCT
+        gross_pnl = -notional * random.uniform(0.005, STOP_LOSS_PCT)
+        exit_reason = "stop loss"
+
     net_pnl = gross_pnl - fee_cost - slippage_cost
-    return round(net_pnl, 4), round(fee_cost + slippage_cost, 4)
+    return round(net_pnl, 4), round(fee_cost + slippage_cost, 4), exit_reason
 
 # ---- SCAN FOR ONE USER ----
 def scan_for_user(user, prices, do_learning):
@@ -360,6 +372,23 @@ def scan_for_user(user, prices, do_learning):
 
     if not bot_enabled:
         log(f"  User {user_id[:8]}... paused")
+        return
+
+    # Hard stop — if balance too low, pause bot automatically
+    if balance <= HARD_STOP_BALANCE:
+        log(f"  ⛔ HARD STOP — balance ${balance:.2f} CAD is below ${HARD_STOP_BALANCE} CAD threshold")
+        supa_post("alerts", {
+            "user_id": user_id,
+            "type": "warn",
+            "title": "⛔ Hard stop triggered!",
+            "description": f"Balance dropped to ${balance:.2f} CAD (below ${HARD_STOP_BALANCE} CAD limit). Bot paused automatically to protect your account."
+        })
+        # Pause the bot
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/bot_settings?user_id=eq.{user_id}",
+            json={"bot_enabled": False, "updated_at": datetime.now(timezone.utc).isoformat()},
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"}
+        )
         return
 
     if balance < 5:
@@ -418,14 +447,14 @@ def scan_for_user(user, prices, do_learning):
         side = decision.get("side", "long")
         confidence = decision.get("confidence", "medium")
         size_cad = balance * (trade_size_pct / 100)
-        pnl, fees = simulate_pnl(size_cad, leverage, confidence)
+        pnl, fees, exit_reason = simulate_pnl(size_cad, leverage, confidence, balance)
         won = pnl > 0
         balance = max(0, balance + pnl)
         total_pnl += pnl
         trade_count += 1
 
         result = "WIN ✓" if won else "LOSS ✗"
-        log(f"  {market} {side.upper()} [{result}] P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} CAD (fees: -${fees:.3f}) | Balance: ${balance:.2f} CAD")
+        log(f"  {market} {side.upper()} [{result}] Exit: {exit_reason} | P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} CAD (fees: -${fees:.3f}) | Balance: ${balance:.2f} CAD")
 
         supa_post("trades", {
             "user_id": user_id, "market": market, "side": side,
@@ -437,7 +466,7 @@ def scan_for_user(user, prices, do_learning):
             "user_id": user_id,
             "type": "win" if won else "loss",
             "title": f"{market} {side.upper()} — {result}",
-            "description": f"{decision.get('reason', '')} · P&L: {'+' if pnl >= 0 else ''}${abs(pnl):.2f} CAD · Fees: -${fees:.3f}"
+            "description": f"{decision.get('reason', '')} · Exit: {exit_reason} · P&L: {'+' if pnl >= 0 else ''}${abs(pnl):.2f} CAD · Fees: -${fees:.3f}"
         })
         if balance / START_CAD < 0.5:
             supa_post("alerts", {
