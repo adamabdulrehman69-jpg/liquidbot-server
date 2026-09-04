@@ -154,7 +154,79 @@ def fetch_market_data(market):
         log(f"  Market data error for {market}: {e}")
         return None
 
-# ---- SELF LEARNING ----
+# ---- FUNDING RATES ----
+def fetch_funding_rate(market):
+    """Fetch real funding rate from Hyperliquid — negative = shorts pay longs (bullish), positive = longs pay shorts (bearish)"""
+    try:
+        r = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "metaAndAssetCtxs"},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        if not r.ok:
+            return None
+        data = r.json()
+        # data is [meta, asset_contexts]
+        if len(data) < 2:
+            return None
+        meta = data[0]
+        ctxs = data[1]
+        coins = [a["name"] for a in meta.get("universe", [])]
+        if market not in coins:
+            return None
+        idx = coins.index(market)
+        ctx = ctxs[idx]
+        funding = float(ctx.get("funding", 0))
+        open_interest = float(ctx.get("openInterest", 0))
+        return {
+            "funding_rate": round(funding * 100, 4),  # as percentage
+            "open_interest": round(open_interest, 2),
+            "funding_signal": "BEARISH (longs pay)" if funding > 0.0001 else "BULLISH (shorts pay)" if funding < -0.0001 else "NEUTRAL"
+        }
+    except Exception as e:
+        log(f"  Funding rate error for {market}: {e}")
+        return None
+
+# ---- ORDER BOOK DEPTH ----
+def fetch_orderbook(market):
+    """Fetch order book to see buy vs sell pressure"""
+    try:
+        r = requests.post(
+            "https://api.hyperliquid.xyz/info",
+            json={"type": "l2Book", "coin": market},
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        if not r.ok:
+            return None
+        data = r.json()
+        levels = data.get("levels", [[], []])
+        if len(levels) < 2:
+            return None
+
+        bids = levels[0][:10]  # top 10 bids
+        asks = levels[1][:10]  # top 10 asks
+
+        bid_volume = sum(float(b["sz"]) for b in bids)
+        ask_volume = sum(float(a["sz"]) for a in asks)
+        total = bid_volume + ask_volume
+
+        bid_pct = round(bid_volume / total * 100, 1) if total > 0 else 50
+        ask_pct = round(ask_volume / total * 100, 1) if total > 0 else 50
+
+        # Bid/ask ratio > 1 = more buyers = bullish
+        ratio = round(bid_volume / ask_volume, 2) if ask_volume > 0 else 1
+
+        return {
+            "bid_pct": bid_pct,
+            "ask_pct": ask_pct,
+            "bid_ask_ratio": ratio,
+            "orderbook_signal": "BULLISH (more buyers)" if ratio > 1.2 else "BEARISH (more sellers)" if ratio < 0.8 else "BALANCED"
+        }
+    except Exception as e:
+        log(f"  Order book error for {market}: {e}")
+        return None
 def get_trade_history(user_id, limit=30):
     """Fetch recent trades from Supabase for learning"""
     rows = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit={limit}&select=market,side,pnl_cad,confidence,reason")
@@ -254,7 +326,7 @@ def build_learning_prompt(analysis):
     return "\n".join(lines)
 
 # ---- CLAUDE AI ----
-def call_claude(market, price_str, risk, leverage, market_data, learning_context=""):
+def call_claude(market, price_str, risk, leverage, market_data, learning_context="", funding=None, orderbook=None):
     if not ANTHROPIC_KEY:
         trade_prob = 0.35 if risk == "High" else 0.25 if risk == "Medium" else 0.15
         side = random.choice(["long", "short"])
@@ -283,6 +355,17 @@ TECHNICAL DATA for {market}:
 - RSI (14): {md['rsi']} — {rsi_signal}
 - Volume vs average: {md['volume_ratio']}x — {vol_signal}
 - Price position in 24h range: {md['price_position_pct']}% (0%=at low, 100%=at high)"""
+
+            # Add funding rate data
+            if funding:
+                data_str += f"""
+- Funding rate: {funding['funding_rate']}% — {funding['funding_signal']}
+- Open interest: ${funding['open_interest']:,.0f}"""
+
+            # Add order book data
+            if orderbook:
+                data_str += f"""
+- Order book: {orderbook['bid_pct']}% bids vs {orderbook['ask_pct']}% asks (ratio: {orderbook['bid_ask_ratio']}) — {orderbook['orderbook_signal']}"""
         else:
             data_str = f"Current price: {price_str} (no additional data available)"
 
@@ -297,13 +380,17 @@ Rules:
 - RSI below 30 = oversold = consider LONG
 - RSI above 70 = overbought = consider SHORT
 - Strong trend + high volume = trade in trend direction
+- Negative funding rate = bullish signal (shorts paying longs)
+- Positive funding rate = bearish signal (longs paying shorts)
+- Order book ratio > 1.2 = more buyers = bullish
+- Order book ratio < 0.8 = more sellers = bearish
 - Sideways or unclear = SKIP
 - Apply self-learning insights above — prefer good markets, avoid bad ones
-- Only trade with 2+ confirming signals
+- Only trade with 2+ confirming signals across RSI, trend, volume, funding, and order book
 - Skip low confidence trades if history shows they lose
 
 Respond ONLY in JSON, no other text:
-{{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "one sentence citing signals and any learned patterns"}}"""
+{{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "one sentence citing specific signals including funding/orderbook if relevant"}}"""
 
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -441,7 +528,13 @@ def scan_for_user(user, prices, do_learning):
     if market_data:
         log(f"  RSI={market_data['rsi']} | 24h={market_data['change_24h_pct']}% | Vol={market_data['volume_ratio']}x")
 
-    decision = call_claude(market, price_str, risk, leverage, market_data, learning_context)
+    # Fetch funding rate and order book
+    funding = fetch_funding_rate(market)
+    orderbook = fetch_orderbook(market)
+    if funding:
+        log(f"  Funding={funding['funding_rate']}% ({funding['funding_signal']}) | OB ratio={orderbook['bid_ask_ratio'] if orderbook else 'N/A'}")
+
+    decision = call_claude(market, price_str, risk, leverage, market_data, learning_context, funding, orderbook)
 
     if decision.get("trade"):
         side = decision.get("side", "long")
@@ -487,34 +580,53 @@ def main():
     log(f"   Claude AI: {'ENABLED ✓' if ANTHROPIC_KEY else 'fallback mode'}")
     log(f"   Scan interval: {SCAN_INTERVAL}s")
     log(f"   Trading fee: {TRADING_FEE*100:.2f}% | Slippage: {SLIPPAGE*100:.2f}%")
+    log(f"   Stop loss: {STOP_LOSS_PCT*100:.1f}% | Take profit: {TAKE_PROFIT_PCT*100:.1f}% | Hard stop: ${HARD_STOP_BALANCE}")
     log(f"   Self-learning: every {LEARN_EVERY} scans")
-    log(f"   Mode: REAL technical analysis + SELF LEARNING 🧠")
+    log(f"   Mode: RSI + SMA + Volume + Funding + Order Book + Self Learning 🧠")
     log("")
 
+    consecutive_errors = 0
+
     while True:
-        scan_counter += 1
-        do_learning = scan_counter % LEARN_EVERY == 0
-        log(f"--- Scan #{scan_counter} started {'(learning scan)' if do_learning else ''} ---")
+        try:
+            scan_counter += 1
+            do_learning = scan_counter % LEARN_EVERY == 0
+            log(f"--- Scan #{scan_counter} started {'(learning scan) 🧠' if do_learning else ''} ---")
 
-        prices = fetch_prices()
-        if not prices:
-            log("  No prices, skipping")
+            prices = fetch_prices()
+            if not prices:
+                log("  No prices, skipping")
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    log("  ⚠️ 3 consecutive errors — waiting 60s before retry")
+                    time.sleep(60)
+                    consecutive_errors = 0
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            consecutive_errors = 0
+            log(f"  Got prices for {len(prices)} markets")
+            users = get_all_users()
+            active = [u for u in users if u.get("bot_enabled", True)]
+            log(f"  Found {len(active)} active user(s)")
+
+            for user in active:
+                try:
+                    scan_for_user(user, prices, do_learning)
+                except Exception as e:
+                    log(f"  ⚠️ Error for user {str(user.get('user_id','?'))[:8]}: {e}")
+
+            log(f"--- Scan complete. Sleeping {SCAN_INTERVAL}s ---\n")
             time.sleep(SCAN_INTERVAL)
-            continue
 
-        log(f"  Got prices for {len(prices)} markets")
-        users = get_all_users()
-        active = [u for u in users if u.get("bot_enabled", True)]
-        log(f"  Found {len(active)} active user(s)")
-
-        for user in active:
-            try:
-                scan_for_user(user, prices, do_learning)
-            except Exception as e:
-                log(f"  Error: {e}")
-
-        log(f"--- Scan complete. Sleeping {SCAN_INTERVAL}s ---\n")
-        time.sleep(SCAN_INTERVAL)
+        except KeyboardInterrupt:
+            log("Bot stopped by user.")
+            break
+        except Exception as e:
+            consecutive_errors += 1
+            log(f"⚠️ Unexpected error (#{consecutive_errors}): {e}")
+            log("  Restarting in 30s...")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
