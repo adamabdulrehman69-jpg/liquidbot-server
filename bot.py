@@ -4,21 +4,23 @@ import requests
 import os
 import json
 from datetime import datetime, timezone
+from collections import defaultdict
 
 # ---- CONFIG ----
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://jcwvfgiudhzdpmqibwji.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_dE-1zCOEwJzWHA3ujLyCdw_UPFvdKf5")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "180"))
-CAD_USD = 0.74
 START_CAD = 100.0
 TRADING_FEE = 0.0004
 SLIPPAGE = 0.0005
+LEARN_EVERY = 5  # review trades every 5 scans
 
 MARKETS = ["BTC", "ETH", "SOL", "AVAX", "LINK", "ARB", "BNB", "XRP"]
 
-# Store recent prices for trend analysis
-price_history = {}
+# In-memory learning state per user
+user_learning = {}
+scan_counter = 0
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -87,11 +89,9 @@ def fetch_prices():
         log(f"Price fetch error: {e}")
         return {}
 
-# ---- FETCH REAL MARKET DATA ----
+# ---- FETCH MARKET DATA ----
 def fetch_market_data(market):
-    """Fetch real candle data from Hyperliquid for technical analysis"""
     try:
-        # Get recent candles (1h candles, last 24)
         now_ms = int(time.time() * 1000)
         r = requests.post(
             "https://api.hyperliquid.xyz/info",
@@ -119,26 +119,14 @@ def fetch_market_data(market):
         volumes = [float(c["v"]) for c in candles]
 
         current = closes[-1]
-        prev = closes[-2]
         open_24h = closes[0]
-
-        # Trend: price change over last 24h
         change_24h = ((current - open_24h) / open_24h) * 100
-
-        # Short term momentum: last 3 candles
-        momentum = closes[-1] - closes[-4] if len(closes) >= 4 else 0
-        momentum_pct = (momentum / closes[-4]) * 100 if len(closes) >= 4 else 0
-
-        # Simple moving averages
+        momentum_pct = ((closes[-1] - closes[-4]) / closes[-4]) * 100 if len(closes) >= 4 else 0
         sma5 = sum(closes[-5:]) / min(5, len(closes))
         sma10 = sum(closes[-10:]) / min(10, len(closes))
-
-        # Volume trend
         avg_vol = sum(volumes[:-1]) / max(1, len(volumes) - 1)
-        current_vol = volumes[-1]
-        vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
+        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 1
 
-        # RSI (simplified)
         gains = [max(0, closes[i] - closes[i-1]) for i in range(1, len(closes))]
         losses = [max(0, closes[i-1] - closes[i]) for i in range(1, len(closes))]
         avg_gain = sum(gains[-14:]) / 14 if len(gains) >= 14 else sum(gains) / max(1, len(gains))
@@ -146,7 +134,6 @@ def fetch_market_data(market):
         rs = avg_gain / avg_loss if avg_loss > 0 else 100
         rsi = 100 - (100 / (1 + rs))
 
-        # Support/resistance (simple high/low range)
         high_24h = max(highs)
         low_24h = min(lows)
         price_position = ((current - low_24h) / (high_24h - low_24h)) * 100 if high_24h != low_24h else 50
@@ -155,8 +142,6 @@ def fetch_market_data(market):
             "current_price": current,
             "change_24h_pct": round(change_24h, 2),
             "momentum_3h_pct": round(momentum_pct, 2),
-            "sma5": round(sma5, 4),
-            "sma10": round(sma10, 4),
             "above_sma5": current > sma5,
             "above_sma10": current > sma10,
             "rsi": round(rsi, 1),
@@ -169,8 +154,107 @@ def fetch_market_data(market):
         log(f"  Market data error for {market}: {e}")
         return None
 
+# ---- SELF LEARNING ----
+def get_trade_history(user_id, limit=30):
+    """Fetch recent trades from Supabase for learning"""
+    rows = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit={limit}&select=market,side,pnl_cad,confidence,reason")
+    return rows if isinstance(rows, list) else []
+
+def analyze_trades(trades):
+    """Analyze trade history to find patterns"""
+    if len(trades) < 5:
+        return None
+
+    market_stats = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0})
+    side_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    confidence_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    winning_reasons = []
+    losing_reasons = []
+
+    for t in trades:
+        market = t.get("market", "?")
+        side = t.get("side", "?")
+        pnl = float(t.get("pnl_cad", 0))
+        confidence = t.get("confidence", "?")
+        reason = t.get("reason", "")
+        won = pnl > 0
+
+        market_stats[market]["wins" if won else "losses"] += 1
+        market_stats[market]["pnl"] += pnl
+        side_stats[side]["wins" if won else "losses"] += 1
+        confidence_stats[confidence]["wins" if won else "losses"] += 1
+
+        if won and reason:
+            winning_reasons.append(reason[:80])
+        elif not won and reason:
+            losing_reasons.append(reason[:80])
+
+    # Find best and worst markets
+    best_markets = sorted(market_stats.keys(), key=lambda m: market_stats[m]["pnl"], reverse=True)[:3]
+    worst_markets = sorted(market_stats.keys(), key=lambda m: market_stats[m]["pnl"])[:3]
+
+    # Win rates
+    total_wins = sum(1 for t in trades if float(t.get("pnl_cad", 0)) > 0)
+    win_rate = round(total_wins / len(trades) * 100, 1)
+
+    # Market win rates
+    market_wr = {}
+    for m, s in market_stats.items():
+        total = s["wins"] + s["losses"]
+        if total > 0:
+            market_wr[m] = round(s["wins"] / total * 100, 1)
+
+    return {
+        "total_trades": len(trades),
+        "win_rate": win_rate,
+        "best_markets": best_markets,
+        "worst_markets": worst_markets,
+        "market_win_rates": market_wr,
+        "winning_reasons": winning_reasons[-3:],
+        "losing_reasons": losing_reasons[-3:],
+        "side_stats": dict(side_stats),
+        "confidence_stats": dict(confidence_stats),
+    }
+
+def build_learning_prompt(analysis):
+    """Build a learning summary to feed back to Claude"""
+    if not analysis:
+        return ""
+
+    mwr = analysis["market_win_rates"]
+    good_markets = [m for m, wr in mwr.items() if wr >= 55]
+    bad_markets = [m for m, wr in mwr.items() if wr < 40]
+
+    lines = [
+        f"\n🧠 SELF-LEARNING INSIGHTS (from last {analysis['total_trades']} trades, win rate: {analysis['win_rate']}%):"
+    ]
+
+    if good_markets:
+        lines.append(f"- PREFER trading: {', '.join(good_markets)} (historically profitable)")
+    if bad_markets:
+        lines.append(f"- AVOID trading: {', '.join(bad_markets)} (historically losing)")
+
+    cs = analysis["confidence_stats"]
+    if "high" in cs:
+        h = cs["high"]
+        total = h["wins"] + h["losses"]
+        if total > 0:
+            lines.append(f"- High confidence trades win {round(h['wins']/total*100)}% of the time")
+    if "low" in cs:
+        l = cs["low"]
+        total = l["wins"] + l["losses"]
+        if total > 0 and round(l["wins"]/total*100) < 45:
+            lines.append(f"- Low confidence trades are losing — skip them")
+
+    if analysis["winning_reasons"]:
+        lines.append(f"- Winning patterns: {' | '.join(analysis['winning_reasons'][:2])}")
+    if analysis["losing_reasons"]:
+        lines.append(f"- Losing patterns to avoid: {' | '.join(analysis['losing_reasons'][:2])}")
+
+    return "\n".join(lines)
+
 # ---- CLAUDE AI ----
-def call_claude(market, price_str, risk, leverage, market_data):
+def call_claude(market, price_str, risk, leverage, market_data, learning_context=""):
     if not ANTHROPIC_KEY:
         trade_prob = 0.35 if risk == "High" else 0.25 if risk == "Medium" else 0.15
         side = random.choice(["long", "short"])
@@ -198,27 +282,28 @@ TECHNICAL DATA for {market}:
 - Trend (SMA5 vs SMA10): {trend}
 - RSI (14): {md['rsi']} — {rsi_signal}
 - Volume vs average: {md['volume_ratio']}x — {vol_signal}
-- Price position in 24h range: {md['price_position_pct']}% (0%=at low, 100%=at high)
-- 24h High: ${md['high_24h']:,.2f} | 24h Low: ${md['low_24h']:,.2f}"""
+- Price position in 24h range: {md['price_position_pct']}% (0%=at low, 100%=at high)"""
         else:
             data_str = f"Current price: {price_str} (no additional data available)"
 
         prompt = f"""You are an expert crypto trading bot analyzing {market} for a paper trade.
 
 {data_str}
+{learning_context}
 
 Settings: Risk={risk}, Leverage={leverage}x
 
-Based on this technical data, decide whether to trade:
+Rules:
 - RSI below 30 = oversold = consider LONG
-- RSI above 70 = overbought = consider SHORT  
-- Strong uptrend + high volume = consider LONG
-- Strong downtrend + high volume = consider SHORT
-- Sideways or unclear = SKIP the trade
-- Only trade when you have at least 2 confirming signals
+- RSI above 70 = overbought = consider SHORT
+- Strong trend + high volume = trade in trend direction
+- Sideways or unclear = SKIP
+- Apply self-learning insights above — prefer good markets, avoid bad ones
+- Only trade with 2+ confirming signals
+- Skip low confidence trades if history shows they lose
 
 Respond ONLY in JSON, no other text:
-{{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "one sentence citing the specific signals"}}"""
+{{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "one sentence citing signals and any learned patterns"}}"""
 
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -241,7 +326,7 @@ Respond ONLY in JSON, no other text:
         text = resp["content"][0]["text"]
         text = text.replace("```json", "").replace("```", "").strip()
         result = json.loads(text)
-        log(f"  Claude: trade={result.get('trade')} side={result.get('side')} conf={result.get('confidence')} | {result.get('reason','')[:60]}")
+        log(f"  Claude: trade={result.get('trade')} side={result.get('side')} conf={result.get('confidence')} | {result.get('reason','')[:70]}")
         return result
     except Exception as e:
         log(f"  Claude error: {e}")
@@ -252,7 +337,7 @@ def simulate_pnl(size_cad, leverage, confidence):
     notional = size_cad * leverage
     fee_cost = notional * TRADING_FEE * 2
     slippage_cost = notional * SLIPPAGE
-    win_prob = 0.56 if confidence == "high" else 0.51 if confidence == "medium" else 0.45
+    win_prob = 0.57 if confidence == "high" else 0.51 if confidence == "medium" else 0.43
     won = random.random() < win_prob
     if won:
         gross_pnl = notional * random.uniform(0.003, 0.018)
@@ -262,7 +347,8 @@ def simulate_pnl(size_cad, leverage, confidence):
     return round(net_pnl, 4), round(fee_cost + slippage_cost, 4)
 
 # ---- SCAN FOR ONE USER ----
-def scan_for_user(user, prices):
+def scan_for_user(user, prices, do_learning):
+    global user_learning
     user_id = user["user_id"]
     balance = float(user.get("balance_cad") or START_CAD)
     total_pnl = float(user.get("total_pnl_cad") or 0)
@@ -280,9 +366,41 @@ def scan_for_user(user, prices):
         log(f"  User {user_id[:8]}... balance too low")
         return
 
+    # Self learning — review trades every N scans
+    if do_learning:
+        log(f"  🧠 Running self-learning review...")
+        trades = get_trade_history(user_id, limit=30)
+        analysis = analyze_trades(trades)
+        if analysis:
+            user_learning[user_id] = build_learning_prompt(analysis)
+            log(f"  🧠 Learned: win rate={analysis['win_rate']}% | best={analysis['best_markets']} | worst={analysis['worst_markets']}")
+            # Save learning insight as alert
+            supa_post("alerts", {
+                "user_id": user_id,
+                "type": "win",
+                "title": f"🧠 Bot learned from {analysis['total_trades']} trades",
+                "description": f"Win rate: {analysis['win_rate']}% | Best markets: {', '.join(analysis['best_markets'])} | Avoiding: {', '.join(analysis['worst_markets'])}"
+            })
+        else:
+            log(f"  🧠 Not enough trades yet to learn from")
+
+    # Get learning context for this user
+    learning_context = user_learning.get(user_id, "")
+
+    # Filter markets based on learning — avoid consistently bad ones
     available = [m for m in MARKETS if m in prices]
     if not available:
         return
+
+    # If we have learning data, prefer good markets
+    if learning_context and user_id in user_learning:
+        trades = get_trade_history(user_id, limit=30)
+        analysis = analyze_trades(trades)
+        if analysis and analysis["best_markets"]:
+            # 70% chance to pick from best markets if available
+            best_available = [m for m in analysis["best_markets"] if m in available]
+            if best_available and random.random() < 0.7:
+                available = best_available
 
     market = random.choice(available)
     price = float(prices[market])
@@ -290,12 +408,11 @@ def scan_for_user(user, prices):
 
     log(f"  User {user_id[:8]}... analyzing {market} @ {price_str}")
 
-    # Fetch real technical data
     market_data = fetch_market_data(market)
     if market_data:
         log(f"  RSI={market_data['rsi']} | 24h={market_data['change_24h_pct']}% | Vol={market_data['volume_ratio']}x")
 
-    decision = call_claude(market, price_str, risk, leverage, market_data)
+    decision = call_claude(market, price_str, risk, leverage, market_data, learning_context)
 
     if decision.get("trade"):
         side = decision.get("side", "long")
@@ -335,16 +452,21 @@ def scan_for_user(user, prices):
 
 # ---- MAIN ----
 def main():
+    global scan_counter
     log("🤖 LiquidBot server started")
     log(f"   Supabase: {SUPABASE_URL}")
     log(f"   Claude AI: {'ENABLED ✓' if ANTHROPIC_KEY else 'fallback mode'}")
     log(f"   Scan interval: {SCAN_INTERVAL}s")
     log(f"   Trading fee: {TRADING_FEE*100:.2f}% | Slippage: {SLIPPAGE*100:.2f}%")
-    log(f"   Mode: REAL technical analysis (RSI, SMA, volume)")
+    log(f"   Self-learning: every {LEARN_EVERY} scans")
+    log(f"   Mode: REAL technical analysis + SELF LEARNING 🧠")
     log("")
 
     while True:
-        log("--- Scan started ---")
+        scan_counter += 1
+        do_learning = scan_counter % LEARN_EVERY == 0
+        log(f"--- Scan #{scan_counter} started {'(learning scan)' if do_learning else ''} ---")
+
         prices = fetch_prices()
         if not prices:
             log("  No prices, skipping")
@@ -358,7 +480,7 @@ def main():
 
         for user in active:
             try:
-                scan_for_user(user, prices)
+                scan_for_user(user, prices, do_learning)
             except Exception as e:
                 log(f"  Error: {e}")
 
