@@ -32,16 +32,91 @@ SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "180"))
 START_CAD = 100.0
 TRADING_FEE = 0.0004
 SLIPPAGE = 0.0005
-LEARN_EVERY = 5  # review trades every 5 scans
+LEARN_EVERY = 5
+MAX_DAILY_LOSS_CAD = 10.0   # stop trading for the day if we lose more than $10 CAD
+WEEKLY_REPORT_SCANS = 336   # every 7 days at 3min intervals = 336 scans
 
 MARKETS = ["BTC", "ETH", "SOL", "AVAX", "LINK", "ARB", "BNB", "XRP"]
 
-# In-memory learning state per user
+# In-memory state per user
 user_learning = {}
+user_daily_pnl = {}       # track daily P&L per user
+user_daily_reset = {}     # track when daily P&L was last reset
 scan_counter = 0
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# ---- DAILY LOSS TRACKING ----
+def check_daily_loss(user_id, pnl):
+    """Track daily P&L and return True if max daily loss hit"""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    # Reset daily P&L if it's a new day
+    if user_daily_reset.get(user_id) != today:
+        user_daily_pnl[user_id] = 0
+        user_daily_reset[user_id] = today
+        log(f"  📅 New day — daily P&L reset for {user_id[:8]}")
+
+    user_daily_pnl[user_id] = user_daily_pnl.get(user_id, 0) + pnl
+    daily_loss = user_daily_pnl[user_id]
+
+    if daily_loss <= -MAX_DAILY_LOSS_CAD:
+        log(f"  🛑 MAX DAILY LOSS hit — ${abs(daily_loss):.2f} CAD lost today (limit: ${MAX_DAILY_LOSS_CAD})")
+        return True
+    return False
+
+# ---- WEEKLY PERFORMANCE REPORT ----
+def send_weekly_report(user_id):
+    """Generate and send a weekly performance summary"""
+    try:
+        trades = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit=200&select=market,side,pnl_cad,confidence,created_at")
+        if not trades or len(trades) < 5:
+            return
+
+        # Filter to last 7 days
+        week_ago = datetime.now(timezone.utc).timestamp() - 7 * 24 * 60 * 60
+        week_trades = [t for t in trades if datetime.fromisoformat(t['created_at'].replace('Z', '+00:00')).timestamp() > week_ago]
+
+        if not week_trades:
+            return
+
+        total = len(week_trades)
+        wins = sum(1 for t in week_trades if float(t.get('pnl_cad', 0)) > 0)
+        losses = total - wins
+        win_rate = round(wins / total * 100, 1)
+        total_pnl = sum(float(t.get('pnl_cad', 0)) for t in week_trades)
+
+        # Best and worst trade
+        sorted_trades = sorted(week_trades, key=lambda t: float(t.get('pnl_cad', 0)))
+        worst = sorted_trades[0]
+        best = sorted_trades[-1]
+
+        # Best market
+        market_pnl = defaultdict(float)
+        for t in week_trades:
+            market_pnl[t['market']] += float(t.get('pnl_cad', 0))
+        best_market = max(market_pnl, key=market_pnl.get)
+
+        emoji = "📈" if total_pnl >= 0 else "📉"
+        report = (
+            f"{emoji} Weekly report: {total} trades | {wins}W/{losses}L | "
+            f"Win rate: {win_rate}% | "
+            f"P&L: {'+' if total_pnl >= 0 else ''}${total_pnl:.2f} CAD | "
+            f"Best market: {best_market} | "
+            f"Best trade: +${float(best.get('pnl_cad',0)):.2f} | "
+            f"Worst trade: ${float(worst.get('pnl_cad',0)):.2f}"
+        )
+
+        supa_post("alerts", {
+            "user_id": user_id,
+            "type": "win" if total_pnl >= 0 else "loss",
+            "title": f"{emoji} Weekly Performance Report",
+            "description": report
+        })
+        log(f"  📊 Weekly report sent: {win_rate}% win rate | {'+' if total_pnl >= 0 else ''}${total_pnl:.2f} CAD")
+    except Exception as e:
+        log(f"  Weekly report error: {e}")
 
 # ---- SUPABASE ----
 def supa_get(table, filters=""):
@@ -564,6 +639,9 @@ def scan_for_user(user, prices, do_learning):
         total_pnl += pnl
         trade_count += 1
 
+        # Check max daily loss
+        daily_limit_hit = check_daily_loss(user_id, pnl)
+
         result = "WIN ✓" if won else "LOSS ✗"
         log(f"  {market} {side.upper()} [{result}] Exit: {exit_reason} | P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} CAD (fees: -${fees:.3f}) | Balance: ${balance:.2f} CAD")
 
@@ -585,6 +663,20 @@ def scan_for_user(user, prices, do_learning):
                 "title": "⚠️ Balance below 50%",
                 "description": f"Paper balance at ${balance:.2f} CAD — consider pausing"
             })
+
+        # Pause bot for the day if max daily loss hit
+        if daily_limit_hit:
+            supa_post("alerts", {
+                "user_id": user_id, "type": "warn",
+                "title": "🛑 Max daily loss reached",
+                "description": f"Lost ${MAX_DAILY_LOSS_CAD:.0f}+ CAD today — bot paused until tomorrow to protect your account."
+            })
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/bot_settings?user_id=eq.{user_id}",
+                json={"bot_enabled": False, "updated_at": datetime.now(timezone.utc).isoformat()},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"}
+            )
+            log(f"  🛑 Bot paused for the day — max daily loss reached")
     else:
         log(f"  {market} SKIP — {decision.get('reason', 'no signal')}")
 
@@ -599,6 +691,7 @@ def main():
     log(f"   Scan interval: {SCAN_INTERVAL}s")
     log(f"   Trading fee: {TRADING_FEE*100:.2f}% | Slippage: {SLIPPAGE*100:.2f}%")
     log(f"   Stop loss: {STOP_LOSS_PCT*100:.1f}% | Take profit: {TAKE_PROFIT_PCT*100:.1f}% | Hard stop: ${HARD_STOP_BALANCE}")
+    log(f"   Max daily loss: ${MAX_DAILY_LOSS_CAD} CAD | Weekly report: every {WEEKLY_REPORT_SCANS} scans")
     log(f"   Self-learning: every {LEARN_EVERY} scans")
     log(f"   Mode: RSI + SMA + Volume + Funding + Order Book + Self Learning 🧠")
 
@@ -613,7 +706,8 @@ def main():
         try:
             scan_counter += 1
             do_learning = scan_counter % LEARN_EVERY == 0
-            log(f"--- Scan #{scan_counter} started {'(learning scan) 🧠' if do_learning else ''} ---")
+            do_weekly = scan_counter % WEEKLY_REPORT_SCANS == 0 and scan_counter > 0
+            log(f"--- Scan #{scan_counter} started {'(learning scan) 🧠' if do_learning else ''}{'(weekly report) 📊' if do_weekly else ''} ---")
 
             prices = fetch_prices()
             if not prices:
@@ -635,6 +729,8 @@ def main():
             for user in active:
                 try:
                     scan_for_user(user, prices, do_learning)
+                    if do_weekly:
+                        send_weekly_report(user["user_id"])
                 except Exception as e:
                     log(f"  ⚠️ Error for user {str(user.get('user_id','?'))[:8]}: {e}")
 
