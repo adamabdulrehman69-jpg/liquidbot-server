@@ -52,11 +52,11 @@ TAKE_PROFIT_PCT = 0.035
 HARD_STOP_BALANCE = 80.0
 MARKETS_PER_SCAN = 3
 
-# Top 20 markets
+# Top markets with good Hyperliquid data
 MARKETS = [
     "BTC", "ETH", "SOL", "AVAX", "LINK", "ARB", "BNB", "XRP",
-    "DOGE", "ADA", "MATIC", "LTC", "NEAR", "APT", "OP",
-    "INJ", "SUI", "TIA", "WIF", "JUP"
+    "DOGE", "ADA", "LTC", "NEAR", "APT", "OP",
+    "INJ", "SUI", "TIA", "WIF", "JUP", "HYPE"
 ]
 
 # Coinbase market pairs (coin -> Coinbase product ID)
@@ -468,7 +468,14 @@ JSON only: {{"trade": true/false, "side": "long"/"short", "confidence": "low"/"m
         if "error" in resp:
             log(f"  Claude error: {resp['error'].get('message','?')[:60]}")
             return {"trade": False, "side": "long", "confidence": "low", "reason": "API error"}
-        text = resp["content"][0]["text"].replace("```json","").replace("```","").strip()
+        text = resp["content"][0]["text"]
+        # Robustly extract JSON from response
+        text = text.replace("```json","").replace("```","").strip()
+        # Find the JSON object within the text
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
         result = json.loads(text)
         log(f"  Claude: {market} trade={result.get('trade')} {result.get('side')} {result.get('confidence')} | {result.get('reason','')[:60]}")
         return result
