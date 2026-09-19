@@ -633,7 +633,22 @@ JSON only: {{"trade": true/false, "side": "long"/"short", "confidence": "low"/"m
         end = text.rfind('}') + 1
         if start >= 0 and end > start:
             text = text[start:end]
-        result = json.loads(text)
+        # Try to fix common JSON issues
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            # Try extracting individual fields manually
+            import re
+            trade = "true" in text.lower() and '"trade": true' in text.lower()
+            side_match = re.search(r'"side":\s*"(long|short)"', text)
+            conf_match = re.search(r'"confidence":\s*"(low|medium|high)"', text)
+            reason_match = re.search(r'"reason":\s*"([^"]{0,100})', text)
+            result = {
+                "trade": trade,
+                "side": side_match.group(1) if side_match else "long",
+                "confidence": conf_match.group(1) if conf_match else "low",
+                "reason": reason_match.group(1) if reason_match else "Partial parse"
+            }
         log(f"  Claude: {market} trade={result.get('trade')} {result.get('side')} {result.get('confidence')} | {result.get('reason','')[:60]}")
         return result
     except Exception as e:
