@@ -326,68 +326,225 @@ def fetch_orderbook(market):
     except:
         return None
 
-# ---- SELF LEARNING ----
-def get_trade_history(user_id, limit=30):
-    rows = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit={limit}&select=market,side,pnl_cad,confidence,reason")
+# ---- IMPROVED PERSISTENT SELF LEARNING ----
+def get_trade_history(user_id, limit=100):
+    """Get more trades for better pattern analysis"""
+    rows = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit={limit}&select=market,side,pnl_cad,confidence,reason,created_at")
     return rows if isinstance(rows, list) else []
 
+def save_insights(user_id, insights):
+    """Save learning insights to Supabase so they persist across restarts"""
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/learning_insights",
+            json={
+                "user_id": user_id,
+                "insight_key": "main",
+                "insight_data": insights,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            },
+            headers={
+                "apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal"
+            }
+        )
+        return r.ok
+    except Exception as e:
+        log(f"  Save insights error: {e}")
+        return False
+
+def load_insights(user_id):
+    """Load previously saved insights from Supabase"""
+    try:
+        rows = supa_get("learning_insights", f"user_id=eq.{user_id}&insight_key=eq.main&select=insight_data")
+        if rows and len(rows) > 0:
+            return rows[0].get("insight_data", {})
+        return {}
+    except:
+        return {}
+
 def analyze_trades(trades):
+    """Deep analysis of trade history for persistent learning"""
     if len(trades) < 5:
         return None
+
     market_stats = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0})
     confidence_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    side_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    hour_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    signal_patterns = defaultdict(lambda: {"wins": 0, "losses": 0})
     winning_reasons = []
     losing_reasons = []
+
     for t in trades:
         market = t.get("market", "?")
         pnl = float(t.get("pnl_cad", 0))
         confidence = t.get("confidence", "?")
+        side = t.get("side", "?")
         reason = t.get("reason", "")
         won = pnl > 0
+
+        # Track by market
         market_stats[market]["wins" if won else "losses"] += 1
         market_stats[market]["pnl"] += pnl
+
+        # Track by confidence
         confidence_stats[confidence]["wins" if won else "losses"] += 1
+
+        # Track by side (long vs short)
+        side_stats[side]["wins" if won else "losses"] += 1
+
+        # Track by hour of day
+        try:
+            hour = datetime.fromisoformat(t.get("created_at","").replace("Z","+00:00")).hour
+            hour_stats[hour]["wins" if won else "losses"] += 1
+        except:
+            pass
+
+        # Extract signal patterns from reason
+        reason_lower = reason.lower()
+        if "rsi" in reason_lower and "oversold" in reason_lower:
+            signal_patterns["rsi_oversold"]["wins" if won else "losses"] += 1
+        if "rsi" in reason_lower and "overbought" in reason_lower:
+            signal_patterns["rsi_overbought"]["wins" if won else "losses"] += 1
+        if "volume" in reason_lower and ("high" in reason_lower or "spike" in reason_lower):
+            signal_patterns["high_volume"]["wins" if won else "losses"] += 1
+        if "uptrend" in reason_lower:
+            signal_patterns["uptrend"]["wins" if won else "losses"] += 1
+        if "downtrend" in reason_lower:
+            signal_patterns["downtrend"]["wins" if won else "losses"] += 1
+        if "funding" in reason_lower and "bullish" in reason_lower:
+            signal_patterns["bullish_funding"]["wins" if won else "losses"] += 1
+        if "orderbook" in reason_lower or "order book" in reason_lower:
+            if "bullish" in reason_lower:
+                signal_patterns["bullish_ob"]["wins" if won else "losses"] += 1
+
         if won and reason:
-            winning_reasons.append(reason[:80])
+            winning_reasons.append(reason[:100])
         elif not won and reason:
-            losing_reasons.append(reason[:80])
-    best_markets = sorted(market_stats.keys(), key=lambda m: market_stats[m]["pnl"], reverse=True)[:3]
-    worst_markets = sorted(market_stats.keys(), key=lambda m: market_stats[m]["pnl"])[:3]
+            losing_reasons.append(reason[:100])
+
+    # Calculate win rates
     total_wins = sum(1 for t in trades if float(t.get("pnl_cad", 0)) > 0)
     win_rate = round(total_wins / len(trades) * 100, 1)
+    total_pnl = sum(float(t.get("pnl_cad", 0)) for t in trades)
+
     market_wr = {}
     for m, s in market_stats.items():
         total = s["wins"] + s["losses"]
-        if total > 0:
-            market_wr[m] = round(s["wins"] / total * 100, 1)
+        if total >= 3:  # need at least 3 trades to be meaningful
+            market_wr[m] = {"wr": round(s["wins"]/total*100,1), "trades": total, "pnl": round(s["pnl"],2)}
+
+    # Best hours (top 3 by win rate with at least 3 trades)
+    hour_wr = {}
+    for h, s in hour_stats.items():
+        total = s["wins"] + s["losses"]
+        if total >= 3:
+            hour_wr[h] = round(s["wins"]/total*100, 1)
+    best_hours = sorted(hour_wr.keys(), key=lambda h: hour_wr[h], reverse=True)[:3]
+
+    # Signal pattern win rates
+    pattern_wr = {}
+    for p, s in signal_patterns.items():
+        total = s["wins"] + s["losses"]
+        if total >= 2:
+            pattern_wr[p] = round(s["wins"]/total*100, 1)
+
+    # Best/worst side
+    long_wr = 0
+    if side_stats["long"]["wins"] + side_stats["long"]["losses"] > 0:
+        long_wr = round(side_stats["long"]["wins"] / (side_stats["long"]["wins"] + side_stats["long"]["losses"]) * 100, 1)
+    short_wr = 0
+    if side_stats["short"]["wins"] + side_stats["short"]["losses"] > 0:
+        short_wr = round(side_stats["short"]["wins"] / (side_stats["short"]["wins"] + side_stats["short"]["losses"]) * 100, 1)
+
+    best_markets = sorted(market_wr.keys(), key=lambda m: market_wr[m]["pnl"], reverse=True)[:4]
+    worst_markets = sorted(market_wr.keys(), key=lambda m: market_wr[m]["pnl"])[:3]
+
     return {
-        "total_trades": len(trades), "win_rate": win_rate,
-        "best_markets": best_markets, "worst_markets": worst_markets,
+        "total_trades": len(trades),
+        "win_rate": win_rate,
+        "total_pnl": round(total_pnl, 2),
+        "best_markets": best_markets,
+        "worst_markets": worst_markets,
         "market_win_rates": market_wr,
-        "winning_reasons": winning_reasons[-3:],
-        "losing_reasons": losing_reasons[-3:],
+        "best_hours": best_hours,
+        "hour_win_rates": hour_wr,
+        "pattern_win_rates": pattern_wr,
+        "long_win_rate": long_wr,
+        "short_win_rate": short_wr,
         "confidence_stats": dict(confidence_stats),
+        "winning_reasons": winning_reasons[-5:],
+        "losing_reasons": losing_reasons[-3:],
     }
 
-def build_learning_prompt(analysis):
-    if not analysis:
+def build_learning_prompt(analysis, saved_insights=None):
+    """Build a rich learning context for Claude using both current and historical insights"""
+    if not analysis and not saved_insights:
         return ""
-    mwr = analysis["market_win_rates"]
-    good_markets = [m for m, wr in mwr.items() if wr >= 55]
-    bad_markets = [m for m, wr in mwr.items() if wr < 40]
-    lines = [f"\n🧠 SELF-LEARNING (from last {analysis['total_trades']} trades, win rate: {analysis['win_rate']}%):"]
+
+    lines = []
+
+    # Merge current analysis with saved historical insights
+    if saved_insights and analysis:
+        # Weight recent trades more — blend current win rate with historical
+        hist_wr = saved_insights.get("win_rate", analysis["win_rate"])
+        blended_wr = round(0.6 * analysis["win_rate"] + 0.4 * hist_wr, 1)
+        lines.append(f"\n🧠 SELF-LEARNING INSIGHTS (current: {analysis['win_rate']}% wr | historical: {hist_wr}% wr | blended: {blended_wr}%):")
+    elif analysis:
+        lines.append(f"\n🧠 SELF-LEARNING INSIGHTS ({analysis['total_trades']} trades | {analysis['win_rate']}% win rate | P&L: {'+' if analysis['total_pnl']>=0 else ''}${analysis['total_pnl']} CAD):")
+
+    a = analysis or saved_insights or {}
+
+    # Market preferences
+    mwr = a.get("market_win_rates", {})
+    good_markets = [m for m, d in mwr.items() if (d["wr"] if isinstance(d, dict) else d) >= 58]
+    bad_markets = [m for m, d in mwr.items() if (d["wr"] if isinstance(d, dict) else d) < 40]
     if good_markets:
-        lines.append(f"- PREFER: {', '.join(good_markets)}")
+        lines.append(f"- PREFER markets: {', '.join(good_markets)} (strong win rate)")
     if bad_markets:
-        lines.append(f"- AVOID: {', '.join(bad_markets)}")
-    cs = analysis["confidence_stats"]
-    if "low" in cs:
-        l = cs["low"]
-        total = l["wins"] + l["losses"]
-        if total > 0 and round(l["wins"]/total*100) < 45:
-            lines.append(f"- Skip low confidence — losing {100-round(l['wins']/total*100)}% of the time")
-    if analysis["winning_reasons"]:
-        lines.append(f"- Winning patterns: {' | '.join(analysis['winning_reasons'][:2])}")
+        lines.append(f"- AVOID markets: {', '.join(bad_markets)} (losing consistently)")
+
+    # Side preference
+    long_wr = a.get("long_win_rate", 50)
+    short_wr = a.get("short_win_rate", 50)
+    if abs(long_wr - short_wr) > 10:
+        better = "LONG" if long_wr > short_wr else "SHORT"
+        lines.append(f"- {better} trades perform better ({long_wr}% long wr vs {short_wr}% short wr) — bias toward {better}")
+
+    # Best trading hours
+    best_hours = a.get("best_hours", [])
+    if best_hours:
+        lines.append(f"- Best trading hours (UTC): {', '.join([f'{h}:00' for h in best_hours[:3]])}")
+
+    # Signal patterns that work
+    pattern_wr = a.get("pattern_win_rates", {})
+    strong_patterns = [p for p, wr in pattern_wr.items() if wr >= 60]
+    weak_patterns = [p for p, wr in pattern_wr.items() if wr < 40]
+    if strong_patterns:
+        lines.append(f"- STRONG signals historically: {', '.join(strong_patterns)}")
+    if weak_patterns:
+        lines.append(f"- WEAK signals to discount: {', '.join(weak_patterns)}")
+
+    # Confidence level performance
+    cs = a.get("confidence_stats", {})
+    for conf_level in ["high", "medium", "low"]:
+        if conf_level in cs:
+            c = cs[conf_level]
+            total = c["wins"] + c["losses"]
+            if total >= 3:
+                wr = round(c["wins"]/total*100)
+                if conf_level == "low" and wr < 45:
+                    lines.append(f"- SKIP low confidence trades — only {wr}% win rate")
+                elif conf_level == "high" and wr >= 60:
+                    lines.append(f"- HIGH confidence trades working well — {wr}% win rate, increase size")
+
+    # Winning patterns
+    winning_reasons = a.get("winning_reasons", [])
+    if winning_reasons:
+        lines.append(f"- Recent winning setups: {winning_reasons[-1][:80]}")
+
     return "\n".join(lines)
 
 # ---- CLAUDE AI ----
@@ -587,14 +744,30 @@ def scan_for_user(user, prices, do_learning):
     # Self learning
     if do_learning:
         log(f"  🧠 Self-learning review...")
-        trades = get_trade_history(user_id, 30)
+        trades = get_trade_history(user_id, 100)
         analysis = analyze_trades(trades)
         if analysis:
-            user_learning[user_id] = build_learning_prompt(analysis)
-            log(f"  🧠 wr={analysis['win_rate']}% | best={analysis['best_markets']}")
+            # Load historical insights and merge
+            saved = load_insights(user_id)
+            user_learning[user_id] = build_learning_prompt(analysis, saved)
+            # Save updated insights to Supabase for persistence
+            save_insights(user_id, analysis)
+            log(f"  🧠 wr={analysis['win_rate']}% | long={analysis['long_win_rate']}% | short={analysis['short_win_rate']}% | best={analysis['best_markets']}")
             supa_post("alerts", {"user_id": user_id, "type": "win",
                 "title": f"🧠 Bot learned from {analysis['total_trades']} trades",
-                "description": f"Win rate: {analysis['win_rate']}% | Best: {', '.join(analysis['best_markets'])} | Avoiding: {', '.join(analysis['worst_markets'])}"})
+                "description": f"Win rate: {analysis['win_rate']}% | Long: {analysis['long_win_rate']}% | Short: {analysis['short_win_rate']}% | Best markets: {', '.join(analysis['best_markets'][:2])}"})
+        else:
+            # Load saved insights even if not enough recent trades
+            saved = load_insights(user_id)
+            if saved:
+                user_learning[user_id] = build_learning_prompt(None, saved)
+                log(f"  🧠 Loaded historical insights (not enough new trades yet)")
+    elif user_id not in user_learning:
+        # On startup, load saved insights immediately
+        saved = load_insights(user_id)
+        if saved:
+            user_learning[user_id] = build_learning_prompt(None, saved)
+            log(f"  🧠 Restored insights from Supabase")
 
     learning_context = user_learning.get(user_id, "")
 
@@ -758,3 +931,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ---- PLACEHOLDER TO VERIFY FILE EXISTS ----
+# Will be replaced with full rewrite
