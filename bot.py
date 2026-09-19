@@ -233,6 +233,29 @@ def fetch_prices():
         log(f"Price fetch error: {e}")
         return {}
 
+# ---- FEAR & GREED INDEX ----
+fear_greed_cache = {"value": None, "label": None, "fetched_at": 0}
+
+def fetch_fear_greed():
+    """Fetch crypto fear & greed index — cached for 1 hour"""
+    global fear_greed_cache
+    now = time.time()
+    # Use cache if less than 1 hour old
+    if fear_greed_cache["value"] and now - fear_greed_cache["fetched_at"] < 3600:
+        return fear_greed_cache
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        if r.ok:
+            data = r.json()["data"][0]
+            value = int(data["value"])
+            label = data["value_classification"]
+            fear_greed_cache = {"value": value, "label": label, "fetched_at": now}
+            log(f"  📊 Fear & Greed: {value} ({label})")
+            return fear_greed_cache
+    except Exception as e:
+        log(f"  Fear & greed error: {e}")
+    return fear_greed_cache
+
 # ---- MARKET DATA ----
 def fetch_market_data(market):
     try:
@@ -610,6 +633,8 @@ Signals:
 - Funding negative = bullish | positive = bearish  
 - OB ratio >1.2 = bullish | <0.8 = bearish
 - Trend direction adds 0.5 signal
+- Fear & Greed <25 = extreme fear = contrarian BUY signal
+- Fear & Greed >75 = extreme greed = contrarian SELL/SHORT signal
 
 Apply self-learning. Be willing to trade on moderate setups.
 {"In LIVE mode, only trade HIGH confidence setups." if LIVE_TRADING else ""}
@@ -698,30 +723,81 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
         return pnl, fees, exit_reason, "live order placed ✅"
 
     else:
-        # Paper simulation
+        # Paper simulation with trailing stop loss
         notional = size_cad * leverage
         fee_cost = notional * fee * 2
         slip_cost = notional * slip
         win_prob = 0.60 if confidence == "high" else 0.53 if confidence == "medium" else 0.45
         won = random.random() < win_prob
-        tp = TAKE_PROFIT_PCT * 1.5 if confidence == "high" else TAKE_PROFIT_PCT
-        gross = notional * random.uniform(0.005, tp) if won else -notional * random.uniform(0.005, STOP_LOSS_PCT)
+
+        if won:
+            # Trailing stop — simulate price running in our favour
+            # Price moves up, trailing stop follows, locks in profit
+            initial_move = random.uniform(0.005, 0.06)  # initial move up to 6%
+            # Trailing stop kicks in at 60% of peak — locks in at least 60% of gains
+            trailing_capture = random.uniform(0.55, 0.85)  # capture 55-85% of move
+            gross = notional * initial_move * trailing_capture
+            exit_reason = "trailing stop"
+            if initial_move > TAKE_PROFIT_PCT:
+                exit_reason = "take profit + trailing"
+        else:
+            # Hard stop loss
+            gross = -notional * random.uniform(0.005, STOP_LOSS_PCT)
+            exit_reason = "stop loss"
+
         pnl = round(gross - fee_cost - slip_cost, 4)
-        exit_reason = "take profit" if won else "stop loss"
         fees = round(fee_cost + slip_cost, 4)
         return pnl, fees, exit_reason, "paper trade"
 
-# ---- DYNAMIC TRADE SIZE ----
-def get_trade_size(base_pct, confidence, balance):
+# ---- VOLATILITY-BASED TRADE SIZING ----
+def get_volatility(market_data):
+    """Calculate market volatility from 24h range"""
+    if not market_data:
+        return 1.0  # assume normal
+    high = market_data.get("high_24h", 0)
+    low = market_data.get("low_24h", 0)
+    current = market_data.get("current_price", 1)
+    if current <= 0:
+        return 1.0
+    range_pct = ((high - low) / current) * 100
+    return round(range_pct, 2)
+
+def get_trade_size(base_pct, confidence, balance, market_data=None, fear_greed=None):
+    """Dynamic trade size based on confidence, volatility and fear/greed"""
+    # Start with confidence adjustment
     if confidence == "high":
         pct = min(base_pct + 5, 25)
     elif confidence == "low":
         pct = max(base_pct - 5, 5)
     else:
         pct = base_pct
-    # In live mode, be more conservative
+
+    # Volatility adjustment — trade smaller when market is wild
+    if market_data:
+        vol = get_volatility(market_data)
+        if vol > 15:       # very volatile — reduce by 40%
+            pct = pct * 0.6
+            log(f"    📉 High volatility ({vol:.1f}%) — reducing trade size")
+        elif vol > 8:      # moderate volatility — reduce by 20%
+            pct = pct * 0.8
+        elif vol < 3:      # very calm — can increase slightly
+            pct = pct * 1.1
+
+    # Fear & Greed adjustment
+    if fear_greed and fear_greed.get("value"):
+        fg = fear_greed["value"]
+        if fg <= 20:       # extreme fear — good buying opportunity, increase size on longs
+            pct = pct * 1.15
+            log(f"    😱 Extreme fear ({fg}) — slight size increase for contrarian trade")
+        elif fg >= 80:     # extreme greed — risky, reduce size
+            pct = pct * 0.75
+            log(f"    🤑 Extreme greed ({fg}) — reducing size, market overextended")
+
+    # Live mode cap
     if LIVE_TRADING:
-        pct = min(pct, 10)  # max 10% per trade in live mode
+        pct = min(pct, 10)
+
+    pct = max(3, min(pct, 30))  # hard limits: 3% min, 30% max
     return balance * (pct / 100)
 
 # ---- SCAN FOR ONE USER ----
@@ -808,6 +884,13 @@ def scan_for_user(user, prices, do_learning):
         selected += random.sample(remaining, min(needed, len(remaining)))
 
     mode_tag = "🔴 LIVE" if LIVE_TRADING else "📄 PAPER"
+
+    # Fetch fear & greed index once per scan (cached hourly)
+    fear_greed = fetch_fear_greed()
+    fg_str = f"Fear & Greed: {fear_greed['value']} ({fear_greed['label']})" if fear_greed.get("value") else ""
+    if fg_str:
+        log(f"  {fg_str}")
+
     log(f"  {mode_tag} | User {user_id[:8]}... scanning: {', '.join(selected)}")
 
     traded_this_scan = False
@@ -823,14 +906,20 @@ def scan_for_user(user, prices, do_learning):
         orderbook = fetch_orderbook(market)
 
         if market_data:
-            log(f"    RSI={market_data['rsi']} | Vol={market_data['volume_ratio']}x | OB={orderbook['bid_ask_ratio'] if orderbook else 'N/A'}")
+            vol = get_volatility(market_data)
+            log(f"    RSI={market_data['rsi']} | Vol={market_data['volume_ratio']}x | OB={orderbook['bid_ask_ratio'] if orderbook else 'N/A'} | Range={vol:.1f}%")
 
-        decision = call_claude(market, price_str, risk, leverage, market_data, learning_context, funding, orderbook)
+        # Add fear & greed to learning context for Claude
+        fg_context = f"\nMarket sentiment: {fg_str}" if fg_str else ""
+        full_context = learning_context + fg_context
+
+        decision = call_claude(market, price_str, risk, leverage, market_data, full_context, funding, orderbook)
 
         if decision.get("trade") and not traded_this_scan:
             side = decision.get("side", "long")
             confidence = decision.get("confidence", "medium")
-            size_cad = get_trade_size(trade_size_pct, confidence, balance)
+            # Pass market_data and fear_greed for volatility-adjusted sizing
+            size_cad = get_trade_size(trade_size_pct, confidence, balance, market_data, fear_greed)
 
             pnl, fees, exit_reason, order_status = execute_trade(
                 user_id, market, side, size_cad, leverage, confidence, balance, price, price_str)
@@ -854,12 +943,12 @@ def scan_for_user(user, prices, do_learning):
                 "price": price_str, "size_cad": round(size_cad, 4),
                 "leverage": 1 if LIVE_TRADING else leverage,
                 "pnl_cad": pnl, "confidence": confidence,
-                "reason": f"{'[LIVE] ' if LIVE_TRADING else ''}{decision.get('reason','')} · {order_status}"
+                "reason": f"{'[LIVE] ' if LIVE_TRADING else ''}{decision.get('reason','')} · {exit_reason} · {fg_str}"
             })
             supa_post("alerts", {
                 "user_id": user_id, "type": "win" if won else "loss",
                 "title": f"{'🔴 LIVE' if LIVE_TRADING else '📄 PAPER'} {market} {side.upper()} — {result}",
-                "description": f"{decision.get('reason','')} · Exit: {exit_reason} · P&L: {'+' if pnl >= 0 else ''}${abs(pnl):.2f} CAD"
+                "description": f"{decision.get('reason','')} · Exit: {exit_reason} · P&L: {'+' if pnl >= 0 else ''}${abs(pnl):.2f} CAD · {fg_str}"
             })
 
             if balance / START_CAD < 0.5:
