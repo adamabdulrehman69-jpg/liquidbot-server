@@ -75,32 +75,54 @@ scan_counter = 0
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ---- COINBASE API ----
+# ---- COINBASE API (Ed25519 signing) ----
 def coinbase_request(method, path, body=None):
-    """Make authenticated request to Coinbase Advanced Trade API"""
+    """Make authenticated request to Coinbase Advanced Trade API using Ed25519 JWT"""
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
         return None
     try:
-        timestamp = str(int(time.time()))
-        body_str = json.dumps(body) if body else ""
-        message = timestamp + method.upper() + path + body_str
-        signature = hmac.new(
-            COINBASE_API_SECRET.encode('utf-8'),
-            message.encode('utf-8'),
-            digestmod=hashlib.sha256
-        ).hexdigest()
-        headers = {
-            "CB-ACCESS-KEY": COINBASE_API_KEY,
-            "CB-ACCESS-SIGN": signature,
-            "CB-ACCESS-TIMESTAMP": timestamp,
-            "Content-Type": "application/json"
+        import jwt
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        key_name = COINBASE_API_KEY
+        key_secret = COINBASE_API_SECRET.strip()
+
+        # Coinbase private key comes as PEM — handle both with and without header
+        if "-----BEGIN" not in key_secret:
+            key_secret = f"-----BEGIN EC PRIVATE KEY-----\n{key_secret}\n-----END EC PRIVATE KEY-----"
+
+        # Replace literal \n with actual newlines if needed
+        key_secret = key_secret.replace("\\n", "\n")
+
+        uri = f"{method.upper()} api.coinbase.com{path}"
+        now = int(time.time())
+        payload = {
+            "sub": key_name,
+            "iss": "cdp",
+            "nbf": now,
+            "exp": now + 120,
+            "uri": uri,
         }
+
+        private_key = load_pem_private_key(key_secret.encode('utf-8'), password=None)
+        token = jwt.encode(
+            payload, private_key, algorithm="ES256",
+            headers={"kid": key_name, "nonce": str(int(time.time() * 1000))}
+        )
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         url = f"https://api.coinbase.com{path}"
         r = requests.request(method, url, headers=headers,
-                           json=body if body else None, timeout=15)
-        return r.json() if r.ok else None
+                             json=body if body else None, timeout=15)
+        if not r.ok:
+            log(f"  Coinbase API {r.status_code}: {r.text[:150]}")
+            return None
+        return r.json()
+    except ImportError as e:
+        log(f"  ⚠️ Missing library: {e} — install PyJWT and cryptography")
+        return None
     except Exception as e:
-        log(f"  Coinbase API error: {e}")
+        log(f"  Coinbase signing error: {e}")
         return None
 
 def get_coinbase_balance():
@@ -111,7 +133,9 @@ def get_coinbase_balance():
     accounts = data.get("accounts", [])
     for acc in accounts:
         if acc.get("currency") == "USD":
-            return float(acc.get("available_balance", {}).get("value", 0))
+            bal = float(acc.get("available_balance", {}).get("value", 0))
+            log(f"  💵 Real Coinbase balance: ${bal:.2f} USD")
+            return bal
     return None
 
 def place_coinbase_order(product_id, side, size_usd):
@@ -120,6 +144,17 @@ def place_coinbase_order(product_id, side, size_usd):
         return None
     try:
         import uuid
+
+        # Check real balance before placing order
+        real_balance = get_coinbase_balance()
+        if real_balance is not None and size_usd > real_balance * 0.95:
+            log(f"  ⚠️ Order size ${size_usd:.2f} too large for balance ${real_balance:.2f} — adjusting")
+            size_usd = real_balance * 0.90  # use max 90% of balance
+
+        if size_usd < 1.0:
+            log(f"  ⚠️ Order size too small (${size_usd:.2f}) — skipping")
+            return None
+
         order_id = str(uuid.uuid4())
         body = {
             "client_order_id": order_id,
@@ -974,16 +1009,26 @@ def scan_for_user(user, prices, do_learning):
 def main():
     global scan_counter
     log("🤖 LiquidBot server started")
-    log(f"   Mode: {'🔴 LIVE TRADING' if LIVE_TRADING else '📄 PAPER TRADING'}")
+    log(f"   Mode: {'🔴 LIVE TRADING — REAL MONEY' if LIVE_TRADING else '📄 PAPER TRADING'}")
     log(f"   Supabase: {SUPABASE_URL}")
     log(f"   Claude AI: {'ENABLED ✓' if ANTHROPIC_KEY else 'fallback'}")
-    log(f"   Coinbase API: {'CONNECTED ✓' if COINBASE_API_KEY else 'not set'}")
     log(f"   Scan: {SCAN_INTERVAL}s | Markets per scan: {MARKETS_PER_SCAN} of {len(MARKETS)}")
     log(f"   Fee: {TRADING_FEE*100:.2f}% | Slippage: {SLIPPAGE*100:.1f}%")
     log(f"   SL: {STOP_LOSS_PCT*100:.1f}% | TP: {TAKE_PROFIT_PCT*100:.1f}% | Hard stop: ${HARD_STOP_BALANCE}")
     log(f"   Max daily loss: ${MAX_DAILY_LOSS_CAD} CAD")
-    if LIVE_TRADING and not COINBASE_API_KEY:
-        log("   ⚠️ WARNING: LIVE_TRADING=true but no Coinbase API key — falling back to paper")
+
+    # Test Coinbase connection
+    if COINBASE_API_KEY:
+        log("   Testing Coinbase connection...")
+        bal = get_coinbase_balance()
+        if bal is not None:
+            log(f"   Coinbase: CONNECTED ✓ | Real balance: ${bal:.2f} USD")
+            if LIVE_TRADING and bal < 5:
+                log(f"   ⚠️ WARNING: Coinbase balance too low (${bal:.2f} USD) — deposit funds first")
+        else:
+            log(f"   Coinbase: ❌ Connection failed — check API key/secret in Railway Variables")
+    else:
+        log("   Coinbase: not configured — add COINBASE_API_KEY to Railway Variables")
     log("")
 
     t = threading.Thread(target=start_keep_alive, daemon=True)
