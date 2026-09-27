@@ -83,16 +83,34 @@ def coinbase_request(method, path, body=None):
     try:
         import jwt
         from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+        import base64
 
         key_name = COINBASE_API_KEY
         key_secret = COINBASE_API_SECRET.strip()
 
-        # Coinbase private key comes as PEM — handle both with and without header
-        if "-----BEGIN" not in key_secret:
-            key_secret = f"-----BEGIN EC PRIVATE KEY-----\n{key_secret}\n-----END EC PRIVATE KEY-----"
-
-        # Replace literal \n with actual newlines if needed
+        # Replace literal \n with actual newlines
         key_secret = key_secret.replace("\\n", "\n")
+
+        # Build proper PEM from whatever format we get
+        # Strip any existing headers/footers first
+        raw = key_secret
+        for header in ["-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----",
+                       "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"]:
+            raw = raw.replace(header, "")
+        raw = raw.replace("\n", "").replace("\r", "").replace(" ", "").strip()
+
+        # Wrap in proper PEM format with 64-char line breaks
+        # Try EC PRIVATE KEY format first
+        lines = [raw[i:i+64] for i in range(0, len(raw), 64)]
+        pem = "-----BEGIN EC PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END EC PRIVATE KEY-----\n"
+
+        try:
+            private_key = load_pem_private_key(pem.encode('utf-8'), password=None)
+        except Exception:
+            # Try PRIVATE KEY format as fallback
+            pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END PRIVATE KEY-----\n"
+            private_key = load_pem_private_key(pem.encode('utf-8'), password=None)
 
         uri = f"{method.upper()} api.coinbase.com{path}"
         now = int(time.time())
@@ -104,7 +122,6 @@ def coinbase_request(method, path, body=None):
             "uri": uri,
         }
 
-        private_key = load_pem_private_key(key_secret.encode('utf-8'), password=None)
         token = jwt.encode(
             payload, private_key, algorithm="ES256",
             headers={"kid": key_name, "nonce": str(int(time.time() * 1000))}
