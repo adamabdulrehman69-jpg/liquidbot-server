@@ -75,121 +75,98 @@ scan_counter = 0
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# ---- COINBASE API (Ed25519 signing) ----
-def coinbase_request(method, path, body=None):
-    """Make authenticated request to Coinbase Advanced Trade API using Ed25519 JWT"""
+# ---- COINBASE API (Official SDK) ----
+def get_coinbase_client():
+    """Get Coinbase Advanced Trade client using official SDK"""
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
         return None
     try:
-        import jwt
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
-        import base64
-
-        key_name = COINBASE_API_KEY
-        key_secret = COINBASE_API_SECRET.strip()
-
-        # Replace literal \n with actual newlines
-        key_secret = key_secret.replace("\\n", "\n")
-
-        # Build proper PEM from whatever format we get
-        # Strip any existing headers/footers first
-        raw = key_secret
-        for header in ["-----BEGIN EC PRIVATE KEY-----", "-----END EC PRIVATE KEY-----",
-                       "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"]:
-            raw = raw.replace(header, "")
-        raw = raw.replace("\n", "").replace("\r", "").replace(" ", "").strip()
-
-        # Wrap in proper PEM format with 64-char line breaks
-        # Try EC PRIVATE KEY format first
-        lines = [raw[i:i+64] for i in range(0, len(raw), 64)]
-        pem = "-----BEGIN EC PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END EC PRIVATE KEY-----\n"
-
-        try:
-            private_key = load_pem_private_key(pem.encode('utf-8'), password=None)
-        except Exception:
-            # Try PRIVATE KEY format as fallback
-            pem = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END PRIVATE KEY-----\n"
-            private_key = load_pem_private_key(pem.encode('utf-8'), password=None)
-
-        uri = f"{method.upper()} api.coinbase.com{path}"
-        now = int(time.time())
-        payload = {
-            "sub": key_name,
-            "iss": "cdp",
-            "nbf": now,
-            "exp": now + 120,
-            "uri": uri,
-        }
-
-        token = jwt.encode(
-            payload, private_key, algorithm="ES256",
-            headers={"kid": key_name, "nonce": str(int(time.time() * 1000))}
-        )
-
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        url = f"https://api.coinbase.com{path}"
-        r = requests.request(method, url, headers=headers,
-                             json=body if body else None, timeout=15)
-        if not r.ok:
-            log(f"  Coinbase API {r.status_code}: {r.text[:150]}")
-            return None
-        return r.json()
-    except ImportError as e:
-        log(f"  ⚠️ Missing library: {e} — install PyJWT and cryptography")
+        from coinbase.rest import RESTClient
+        # Coinbase SDK expects the key with proper \n newlines
+        secret = COINBASE_API_SECRET.strip().replace("\\n", "\n")
+        # If no PEM headers, add them
+        if "-----BEGIN" not in secret:
+            secret = f"-----BEGIN EC PRIVATE KEY-----\n{secret}\n-----END EC PRIVATE KEY-----\n"
+        return RESTClient(api_key=COINBASE_API_KEY, api_secret=secret)
+    except ImportError:
+        log("  ⚠️ coinbase-advanced-py not installed")
         return None
     except Exception as e:
-        log(f"  Coinbase signing error: {e}")
+        log(f"  Coinbase client error: {e}")
+        return None
+
+def coinbase_request(method, path, body=None):
+    """Make authenticated request using official Coinbase SDK"""
+    client = get_coinbase_client()
+    if not client:
+        return None
+    try:
+        if method == "GET":
+            resp = client.get(path)
+        else:
+            resp = client.post(path, data=json.dumps(body) if body else None)
+        return resp if isinstance(resp, dict) else resp.__dict__ if hasattr(resp, '__dict__') else None
+    except Exception as e:
+        log(f"  Coinbase API error: {e}")
         return None
 
 def get_coinbase_balance():
-    """Get real USD balance from Coinbase"""
-    data = coinbase_request("GET", "/api/v3/brokerage/accounts")
-    if not data:
+    """Get real USD balance from Coinbase using official SDK"""
+    try:
+        client = get_coinbase_client()
+        if not client:
+            return None
+        accounts = client.get_accounts()
+        acct_list = accounts.accounts if hasattr(accounts, 'accounts') else accounts.get('accounts', [])
+        for acc in acct_list:
+            currency = acc.currency if hasattr(acc, 'currency') else acc.get('currency', '')
+            if currency == "USD":
+                bal_obj = acc.available_balance if hasattr(acc, 'available_balance') else acc.get('available_balance', {})
+                val = bal_obj.value if hasattr(bal_obj, 'value') else bal_obj.get('value', 0)
+                bal = float(val)
+                log(f"  💵 Real Coinbase balance: ${bal:.2f} USD")
+                return bal
         return None
-    accounts = data.get("accounts", [])
-    for acc in accounts:
-        if acc.get("currency") == "USD":
-            bal = float(acc.get("available_balance", {}).get("value", 0))
-            log(f"  💵 Real Coinbase balance: ${bal:.2f} USD")
-            return bal
-    return None
+    except Exception as e:
+        log(f"  Coinbase balance error: {e}")
+        return None
 
 def place_coinbase_order(product_id, side, size_usd):
-    """Place a real market order on Coinbase Advanced Trade"""
+    """Place a real market order on Coinbase Advanced Trade using official SDK"""
     if not COINBASE_API_KEY:
         return None
     try:
         import uuid
+        client = get_coinbase_client()
+        if not client:
+            return None
 
         # Check real balance before placing order
         real_balance = get_coinbase_balance()
         if real_balance is not None and size_usd > real_balance * 0.95:
             log(f"  ⚠️ Order size ${size_usd:.2f} too large for balance ${real_balance:.2f} — adjusting")
-            size_usd = real_balance * 0.90  # use max 90% of balance
+            size_usd = real_balance * 0.90
 
         if size_usd < 1.0:
             log(f"  ⚠️ Order size too small (${size_usd:.2f}) — skipping")
             return None
 
         order_id = str(uuid.uuid4())
-        body = {
-            "client_order_id": order_id,
-            "product_id": product_id,
-            "side": "BUY" if side == "long" else "SELL",
-            "order_configuration": {
-                "market_market_ioc": {
-                    "quote_size": str(round(size_usd, 2))
-                }
-            }
-        }
-        result = coinbase_request("POST", "/api/v3/brokerage/orders", body)
-        if result and result.get("success"):
-            order = result.get("order", {})
-            log(f"  ✅ Real order placed: {product_id} {side.upper()} ${size_usd:.2f} USD — ID: {order.get('order_id','?')[:8]}")
+        order = client.market_order(
+            client_order_id=order_id,
+            product_id=product_id,
+            side="BUY" if side == "long" else "SELL",
+            quote_size=str(round(size_usd, 2))
+        )
+
+        if order and (hasattr(order, 'success') and order.success or
+                      isinstance(order, dict) and order.get('success')):
+            order_id_resp = (order.order_id if hasattr(order, 'order_id')
+                            else order.get('order', {}).get('order_id', '?'))
+            log(f"  ✅ Real order placed: {product_id} {side.upper()} ${size_usd:.2f} USD — ID: {str(order_id_resp)[:8]}")
             return order
         else:
-            log(f"  ❌ Order failed: {result}")
+            log(f"  ❌ Order failed: {order}")
             return None
     except Exception as e:
         log(f"  Order error: {e}")
