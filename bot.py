@@ -59,12 +59,12 @@ MARKETS = [
     "INJ", "SUI", "TIA", "WIF", "JUP", "HYPE"
 ]
 
-# Coinbase market pairs — CAD pairs for Canadian accounts
+# Coinbase market pairs — USDC pairs
 COINBASE_PAIRS = {
-    "BTC": "BTC-CAD", "ETH": "ETH-CAD", "SOL": "SOL-CAD",
-    "AVAX": "AVAX-CAD", "LINK": "LINK-CAD", "DOGE": "DOGE-CAD",
-    "ADA": "ADA-CAD", "LTC": "LTC-CAD", "XRP": "XRP-CAD",
-    "DOT": "DOT-CAD"
+    "BTC": "BTC-USDC", "ETH": "ETH-USDC", "SOL": "SOL-USDC",
+    "AVAX": "AVAX-USDC", "LINK": "LINK-USDC", "DOGE": "DOGE-USDC",
+    "ADA": "ADA-USDC", "LTC": "LTC-USDC", "XRP": "XRP-USDC",
+    "BNB": "BNB-USDC"
 }
 
 user_learning = {}
@@ -118,8 +118,8 @@ def get_coinbase_balance():
             return None
         accounts = client.get_accounts()
         acct_list = accounts.accounts if hasattr(accounts, 'accounts') else accounts.get('accounts', [])
-        # Try CAD first, then USD
-        for currency in ["CAD", "USD"]:
+        # Try USDC first, then USD, then CAD
+        for currency in ["USDC", "USD", "CAD"]:
             for acc in acct_list:
                 curr = acc.currency if hasattr(acc, 'currency') else acc.get('currency', '')
                 if curr == currency:
@@ -732,8 +732,8 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
             log(f"  {market} not available on Coinbase CAD pairs — falling back to paper")
             # Fall through to paper simulation below
         else:
-            log(f"  💵 LIVE ORDER: {product_id} {side.upper()} ${size_cad:.2f} CAD")
-            order = place_coinbase_order(product_id, side, size_cad)
+            log(f"  💵 LIVE ORDER: {product_id} {side.upper()} ${size_cad:.2f} USDC")
+            order = place_coinbase_order(product_id, side, size_cad * 0.72)  # CAD to USDC
 
             if not order:
                 log(f"  ❌ Live order failed — falling back to paper simulation")
@@ -1026,14 +1026,14 @@ def main():
                     products = client.get_products()
                     prod_list = products.products if hasattr(products, 'products') else products.get('products', [])
                     cad_pairs = [p.product_id if hasattr(p, 'product_id') else p.get('product_id','')
-                                for p in prod_list if 'CAD' in (p.product_id if hasattr(p, 'product_id') else p.get('product_id',''))]
-                    log(f"   Available CAD pairs: {', '.join(sorted(cad_pairs)[:10])}")
+                                for p in prod_list if 'USDC' in (p.product_id if hasattr(p, 'product_id') else p.get('product_id',''))]
+                    log(f"   Available USDC pairs: {', '.join(sorted(cad_pairs)[:10])}")
                     # Update COINBASE_PAIRS to only use available pairs
                     global COINBASE_PAIRS
                     COINBASE_PAIRS = {}
                     for coin in ["BTC","ETH","SOL","AVAX","LINK","DOGE","ADA","LTC","XRP","BNB"]:
-                        if f"{coin}-CAD" in cad_pairs:
-                            COINBASE_PAIRS[coin] = f"{coin}-CAD"
+                        if f"{coin}-USDC" in cad_pairs:
+                            COINBASE_PAIRS[coin] = f"{coin}-USDC"
                     log(f"   Configured pairs: {list(COINBASE_PAIRS.keys())}")
             except Exception as e:
                 log(f"   Could not list products: {e}")
