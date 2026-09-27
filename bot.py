@@ -59,12 +59,12 @@ MARKETS = [
     "INJ", "SUI", "TIA", "WIF", "JUP", "HYPE"
 ]
 
-# Coinbase market pairs (coin -> Coinbase product ID)
+# Coinbase market pairs — CAD pairs for Canadian accounts
 COINBASE_PAIRS = {
-    "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
-    "AVAX": "AVAX-USD", "LINK": "LINK-USD", "DOGE": "DOGE-USD",
-    "ADA": "ADA-USD", "LTC": "LTC-USD", "XRP": "XRP-USD",
-    "MATIC": "MATIC-USD"
+    "BTC": "BTC-CAD", "ETH": "ETH-CAD", "SOL": "SOL-CAD",
+    "AVAX": "AVAX-CAD", "LINK": "LINK-CAD", "DOGE": "DOGE-CAD",
+    "ADA": "ADA-CAD", "LTC": "LTC-CAD", "XRP": "XRP-CAD",
+    "DOT": "DOT-CAD"
 }
 
 user_learning = {}
@@ -111,21 +111,25 @@ def coinbase_request(method, path, body=None):
         return None
 
 def get_coinbase_balance():
-    """Get real USD balance from Coinbase using official SDK"""
+    """Get real CAD balance from Coinbase"""
     try:
         client = get_coinbase_client()
         if not client:
             return None
         accounts = client.get_accounts()
         acct_list = accounts.accounts if hasattr(accounts, 'accounts') else accounts.get('accounts', [])
-        for acc in acct_list:
-            currency = acc.currency if hasattr(acc, 'currency') else acc.get('currency', '')
-            if currency == "USD":
-                bal_obj = acc.available_balance if hasattr(acc, 'available_balance') else acc.get('available_balance', {})
-                val = bal_obj.value if hasattr(bal_obj, 'value') else bal_obj.get('value', 0)
-                bal = float(val)
-                log(f"  💵 Real Coinbase balance: ${bal:.2f} USD")
-                return bal
+        # Try CAD first, then USD
+        for currency in ["CAD", "USD"]:
+            for acc in acct_list:
+                curr = acc.currency if hasattr(acc, 'currency') else acc.get('currency', '')
+                if curr == currency:
+                    bal_obj = acc.available_balance if hasattr(acc, 'available_balance') else acc.get('available_balance', {})
+                    val = bal_obj.value if hasattr(bal_obj, 'value') else bal_obj.get('value', 0)
+                    bal = float(val)
+                    if bal > 0:
+                        log(f"  💵 Real Coinbase balance: ${bal:.2f} {currency}")
+                        return bal
+        log("  ⚠️ No CAD or USD balance found")
         return None
     except Exception as e:
         log(f"  Coinbase balance error: {e}")
@@ -1018,7 +1022,7 @@ def main():
         if bal is not None:
             log(f"   Coinbase: CONNECTED ✓ | Real balance: ${bal:.2f} USD")
             if LIVE_TRADING and bal < 5:
-                log(f"   ⚠️ WARNING: Coinbase balance too low (${bal:.2f} USD) — deposit funds first")
+                log(f"   ⚠️ WARNING: Coinbase balance too low (${bal:.2f}) — deposit funds first")
         else:
             log(f"   Coinbase: ❌ Connection failed — check API key/secret in Railway Variables")
     else:
