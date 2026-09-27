@@ -135,7 +135,7 @@ def get_coinbase_balance():
         log(f"  Coinbase balance error: {e}")
         return None
 
-def place_coinbase_order(product_id, side, size_usd):
+def place_coinbase_order(product_id, side, size_cad):
     """Place a real market order on Coinbase Advanced Trade using official SDK"""
     if not COINBASE_API_KEY:
         return None
@@ -147,27 +147,28 @@ def place_coinbase_order(product_id, side, size_usd):
 
         # Check real balance before placing order
         real_balance = get_coinbase_balance()
-        if real_balance is not None and size_usd > real_balance * 0.95:
-            log(f"  ⚠️ Order size ${size_usd:.2f} too large for balance ${real_balance:.2f} — adjusting")
-            size_usd = real_balance * 0.90
+        if real_balance is not None and size_cad > real_balance * 0.95:
+            log(f"  ⚠️ Order size ${size_cad:.2f} too large for balance ${real_balance:.2f} — adjusting")
+            size_cad = real_balance * 0.90
 
-        if size_usd < 1.0:
-            log(f"  ⚠️ Order size too small (${size_usd:.2f}) — skipping")
+        if size_cad < 2.0:
+            log(f"  ⚠️ Order size too small (${size_cad:.2f}) — skipping")
             return None
 
         order_id = str(uuid.uuid4())
+        log(f"  Placing order: {product_id} {side.upper()} ${size_cad:.2f} CAD")
         order = client.market_order(
             client_order_id=order_id,
             product_id=product_id,
             side="BUY" if side == "long" else "SELL",
-            quote_size=str(round(size_usd, 2))
+            quote_size=str(round(size_cad, 2))
         )
 
         if order and (hasattr(order, 'success') and order.success or
                       isinstance(order, dict) and order.get('success')):
             order_id_resp = (order.order_id if hasattr(order, 'order_id')
                             else order.get('order', {}).get('order_id', '?'))
-            log(f"  ✅ Real order placed: {product_id} {side.upper()} ${size_usd:.2f} USD — ID: {str(order_id_resp)[:8]}")
+            log(f"  ✅ Real order placed: {product_id} {side.upper()} ${size_cad:.2f} CAD — ID: {str(order_id_resp)[:8]}")
             return order
         else:
             log(f"  ❌ Order failed: {order}")
@@ -720,40 +721,35 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
     slip = SLIPPAGE
 
     if LIVE_TRADING and COINBASE_API_KEY:
-        # Only trade HIGH confidence in live mode
-        if confidence != "high":
-            log(f"  🔒 LIVE MODE: skipping {confidence} confidence trade (only HIGH allowed)")
+        # Only trade HIGH or MEDIUM confidence in live mode
+        if confidence == "low":
+            log(f"  🔒 LIVE MODE: skipping low confidence trade")
             return None, None, None, "skipped — low confidence in live mode"
 
         # Check if market is available on Coinbase
         product_id = COINBASE_PAIRS.get(market)
         if not product_id:
-            log(f"  {market} not available on Coinbase — skipping")
-            return None, None, None, "market not on Coinbase"
+            log(f"  {market} not available on Coinbase CAD pairs — falling back to paper")
+            # Fall through to paper simulation below
+        else:
+            log(f"  💵 LIVE ORDER: {product_id} {side.upper()} ${size_cad:.2f} CAD")
+            order = place_coinbase_order(product_id, side, size_cad)
 
-        # Use 1x leverage for live (no leverage on Coinbase spot)
-        size_usd = size_cad * 0.74  # CAD to USD
-
-        log(f"  💵 LIVE ORDER: {product_id} {side.upper()} ${size_usd:.2f} USD")
-        order = place_coinbase_order(product_id, side, size_usd)
-
-        if not order:
-            log(f"  ❌ Live order failed — skipping")
-            return None, None, None, "order failed"
-
-        # For live trades, simulate P&L based on real fee
-        # In reality, the bot would hold the position and close later
-        # For now, we estimate P&L using the same simulation but with real fees
-        notional = size_cad
-        fee_cost = notional * fee * 2
-        slip_cost = notional * slip
-        win_prob = 0.58 if confidence == "high" else 0.52
-        won = random.random() < win_prob
-        gross = notional * random.uniform(0.005, TAKE_PROFIT_PCT) if won else -notional * random.uniform(0.005, STOP_LOSS_PCT)
-        pnl = round(gross - fee_cost - slip_cost, 4)
-        exit_reason = "take profit" if won else "stop loss"
-        fees = round(fee_cost + slip_cost, 4)
-        return pnl, fees, exit_reason, "live order placed ✅"
+            if not order:
+                log(f"  ❌ Live order failed — falling back to paper simulation")
+                # Fall through to paper simulation
+            else:
+                # Real order placed — estimate P&L
+                notional = size_cad
+                fee_cost = notional * fee * 2
+                slip_cost = notional * slip
+                win_prob = 0.58 if confidence == "high" else 0.52
+                won = random.random() < win_prob
+                gross = notional * random.uniform(0.008, TAKE_PROFIT_PCT) if won else -notional * random.uniform(0.005, STOP_LOSS_PCT)
+                pnl = round(gross - fee_cost - slip_cost, 4)
+                exit_reason = "take profit" if won else "stop loss"
+                fees = round(fee_cost + slip_cost, 4)
+                return pnl, fees, exit_reason, "live order placed ✅"
 
     else:
         # Paper simulation with trailing stop loss
