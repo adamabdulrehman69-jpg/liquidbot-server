@@ -49,7 +49,7 @@ WEEKLY_REPORT_SCANS = 336
 MAX_DAILY_LOSS_CAD = 10.0
 STOP_LOSS_PCT = 0.025
 TAKE_PROFIT_PCT = 0.035
-HARD_STOP_BALANCE = 80.0
+HARD_STOP_BALANCE = 35.0    # stop if balance drops below $35 (50% of starting USDC)
 MARKETS_PER_SCAN = 3
 
 # Top markets with good Hyperliquid data
