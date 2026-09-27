@@ -1016,13 +1016,31 @@ def main():
         log("   Testing Coinbase connection...")
         bal = get_coinbase_balance()
         if bal is not None:
-            log(f"   Coinbase: CONNECTED ✓ | Real balance: ${bal:.2f} USD")
+            log(f"   Coinbase: CONNECTED ✓ | Real balance: ${bal:.2f} CAD")
             if LIVE_TRADING and bal < 5:
-                log(f"   ⚠️ WARNING: Coinbase balance too low (${bal:.2f}) — deposit funds first")
+                log(f"   ⚠️ WARNING: Coinbase balance too low — deposit funds first")
+            # List available CAD pairs to verify
+            try:
+                client = get_coinbase_client()
+                if client:
+                    products = client.get_products()
+                    prod_list = products.products if hasattr(products, 'products') else products.get('products', [])
+                    cad_pairs = [p.product_id if hasattr(p, 'product_id') else p.get('product_id','')
+                                for p in prod_list if 'CAD' in (p.product_id if hasattr(p, 'product_id') else p.get('product_id',''))]
+                    log(f"   Available CAD pairs: {', '.join(sorted(cad_pairs)[:10])}")
+                    # Update COINBASE_PAIRS to only use available pairs
+                    global COINBASE_PAIRS
+                    COINBASE_PAIRS = {}
+                    for coin in ["BTC","ETH","SOL","AVAX","LINK","DOGE","ADA","LTC","XRP","BNB"]:
+                        if f"{coin}-CAD" in cad_pairs:
+                            COINBASE_PAIRS[coin] = f"{coin}-CAD"
+                    log(f"   Configured pairs: {list(COINBASE_PAIRS.keys())}")
+            except Exception as e:
+                log(f"   Could not list products: {e}")
         else:
             log(f"   Coinbase: ❌ Connection failed — check API key/secret in Railway Variables")
     else:
-        log("   Coinbase: not configured — add COINBASE_API_KEY to Railway Variables")
+        log("   Coinbase: not configured")
     log("")
 
     t = threading.Thread(target=start_keep_alive, daemon=True)
