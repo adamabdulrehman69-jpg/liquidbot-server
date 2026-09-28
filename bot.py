@@ -251,7 +251,7 @@ def place_limit_buy(product_id, size_usdc):
 
         log(f"  Placing LIMIT BUY: {product_id} {base_size} @ ${limit_price} (~${size_usdc:.2f} USDC, maker fee)")
         order = client.limit_order_gtc_buy(
-            client_order_id=str(uuid.uuid4()),
+            client_order_id=f"lqb-{uuid.uuid4()}",
             product_id=product_id,
             base_size=base_size,
             limit_price=limit_price,
@@ -375,7 +375,7 @@ def sell_coinbase_position(product_id, max_coin=None):
 
         log(f"  Placing SELL: {product_id} {base_size} {base_currency} (balance {balance})")
         order = client.market_order_sell(
-            client_order_id=str(uuid.uuid4()),
+            client_order_id=f"lqb-{uuid.uuid4()}",
             product_id=product_id,
             base_size=base_size
         )
@@ -1009,6 +1009,53 @@ def close_live_position(position_id, exit_reason):
     )
     return r.ok
 
+def recover_trade_meta(user_id, market):
+    """After a restart, get the buy's confidence/reason back from its BOUGHT alert"""
+    try:
+        rows = supa_get("alerts", f"user_id=eq.{user_id}&title=like.*{market}%20BOUGHT&order=created_at.desc&limit=1&select=description")
+        desc = rows[0].get("description", "") if rows else ""
+        parts = [x.strip() for x in desc.split("·")]
+        conf = next((x.split()[0] for x in parts if x.endswith("confidence")), "medium")
+        reason = parts[-1] if len(parts) >= 3 else ""
+        return {"confidence": conf if conf in ("low", "medium", "high") else "medium", "reason": reason}
+    except Exception:
+        return {}
+
+def recover_after_restart():
+    """
+    Runs on startup. If the bot was restarted in the middle of a limit buy,
+    cancel that leftover order and track anything it already bought.
+    Open positions themselves live in Supabase, so they're picked up automatically.
+    """
+    client = get_coinbase_client()
+    if not client:
+        return
+    try:
+        resp = client.list_orders(order_status=["OPEN"])
+        orders = [o for o in (_cb_get(resp, "orders", []) or [])
+                  if str(_cb_get(o, "client_order_id", "")).startswith("lqb-")]
+        if not orders:
+            return
+        users = get_all_users()
+        user_id = users[0]["user_id"] if users else None
+        for o in orders:
+            oid = _cb_get(o, "order_id")
+            pid = _cb_get(o, "product_id")
+            client.cancel_orders(order_ids=[oid])
+            log(f"   🧹 Cancelled leftover bot order {pid} ({str(oid)[:8]})")
+            time.sleep(1)
+            o = _cb_get(client.get_order(oid), "order", {})
+            filled = float(_cb_get(o, "filled_size", 0) or 0)
+            if filled > 0 and _cb_get(o, "side") == "BUY" and user_id:
+                market = pid.split("-")[0]
+                avg = float(_cb_get(o, "average_filled_price", 0) or 0)
+                spent = float(_cb_get(o, "total_value_after_fees", 0) or 0) or filled * avg
+                if not any(p.get("market") == market for p in get_open_positions(user_id)):
+                    save_live_position(user_id, market, pid, avg, filled, spent)
+                    log(f"   📝 Tracked partly-filled buy: {filled} {market} @ ${avg:.4f}")
+    except Exception as e:
+        log(f"   Restart recovery error: {e}")
+
 def update_stop_price(position_id, new_stop):
     """Save the raised trailing stop so it survives restarts"""
     try:
@@ -1089,7 +1136,7 @@ def check_and_close_positions(user_id, prices):
             closed += 1
 
             close_live_position(pos_id, exit_reason)
-            meta = open_trade_meta.pop((user_id, market), {})
+            meta = open_trade_meta.pop((user_id, market), None) or recover_trade_meta(user_id, market)
             supa_post("trades", {
                 "user_id": user_id, "market": market, "side": "long",
                 "price": f"${current_price:.4f}", "size_cad": round(size_usdc, 4),
@@ -1512,6 +1559,13 @@ def main():
     else:
         log("   Coinbase: not configured")
     log("")
+
+    if LIVE_TRADING:
+        recover_after_restart()
+        for u in get_all_users():
+            open_now = get_open_positions(u["user_id"])
+            if open_now:
+                log(f"   📂 Picked up {len(open_now)} open position(s): {', '.join(p.get('market','?') for p in open_now)}")
 
     t = threading.Thread(target=start_keep_alive, daemon=True)
     t.start()
