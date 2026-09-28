@@ -44,13 +44,17 @@ LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").lower() == "true"  # flip
 
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "180"))
 START_CAD = 100.0
-TRADING_FEE = 0.0006       # Coinbase Advanced fee ~0.6%
+TRADING_FEE = 0.006        # Coinbase Advanced taker fee 0.6% (market orders)
+MAKER_FEE = 0.004          # Coinbase Advanced maker fee 0.4% (limit orders that wait)
 SLIPPAGE = 0.001           # 0.1% slippage for real orders
 LEARN_EVERY = 5
 WEEKLY_REPORT_SCANS = 336
 MAX_DAILY_LOSS_CAD = 10.0
-STOP_LOSS_PCT = 0.025
-TAKE_PROFIT_PCT = 0.035
+STOP_LOSS_PCT = 0.02        # sell if down 2%
+TAKE_PROFIT_PCT = 0.03      # at +3% the trailing stop turns on (no fixed sell point)
+TRAIL_GAP_PCT = 0.012       # trailing stop sits 1.2% under the highest price seen
+LIVE_SIZE_PCT = {"medium": 10, "high": 20}   # % of free USDC per trade by confidence (low = skip)
+LIMIT_BUY_WAIT = 60         # seconds to wait for a limit buy to fill before cancelling
 HARD_STOP_BALANCE = 35.0    # stop if balance drops below $35 (50% of starting USDC)
 MARKETS_PER_SCAN = 3
 FORCE_CLOSE_ON_START = os.environ.get("FORCE_CLOSE_ON_START", "false").lower() == "true"  # sells all open positions once per boot
@@ -209,6 +213,91 @@ def place_coinbase_order(product_id, side, size_cad):
         return {"order_id": order_id_resp, "size_usdc": size_cad, **fill}
     except Exception as e:
         log(f"  Order error: {e}")
+        return None
+
+def place_limit_buy(product_id, size_usdc):
+    """
+    Post-only limit BUY at the best bid, so we pay the 0.4% maker fee instead of 0.6%.
+    Waits LIMIT_BUY_WAIT seconds, cancels whatever didn't fill. Doesn't chase the price.
+    """
+    client = get_coinbase_client()
+    if not client:
+        return None
+    try:
+        real_balance = get_coinbase_balance()
+        if real_balance is not None and size_usdc > real_balance * 0.95:
+            size_usdc = real_balance * 0.90
+        if size_usdc < 2.0:
+            log(f"  ⚠️ Order size too small (${size_usdc:.2f}) — skipping")
+            return None
+
+        p = client.get_product(product_id)
+        base_inc = str(_cb_get(p, "base_increment", "0.00000001"))
+        quote_inc = str(_cb_get(p, "quote_increment", "0.01"))
+        base_min = float(_cb_get(p, "base_min_size", 0) or 0)
+
+        book = client.get_best_bid_ask(product_ids=[product_id])
+        pb = (_cb_get(book, "pricebooks", []) or [None])[0]
+        bid = float(_cb_get((_cb_get(pb, "bids", []) or [{}])[0], "price", 0) or 0)
+        if bid <= 0:
+            log(f"  ⚠️ No bid price for {product_id} — skipping")
+            return None
+
+        limit_price = floor_to_increment(bid, quote_inc)
+        base_size = floor_to_increment(size_usdc / (1 + MAKER_FEE) / float(limit_price), base_inc)
+        if float(base_size) < base_min:
+            log(f"  ⚠️ {product_id} size {base_size} below min {base_min} — skipping")
+            return None
+
+        log(f"  Placing LIMIT BUY: {product_id} {base_size} @ ${limit_price} (~${size_usdc:.2f} USDC, maker fee)")
+        order = client.limit_order_gtc_buy(
+            client_order_id=str(uuid.uuid4()),
+            product_id=product_id,
+            base_size=base_size,
+            limit_price=limit_price,
+            post_only=True
+        )
+        if not _cb_get(order, "success", False):
+            err = _cb_get(order, "error_response", {})
+            reason = f"{_cb_get(err, 'error', '')} {_cb_get(err, 'message', '')} {_cb_get(err, 'preview_failure_reason', '')}".strip()
+            log(f"  ❌ LIMIT BUY rejected: {product_id} — {reason or order}")
+            return None
+        order_id = _cb_get(_cb_get(order, "success_response", {}), "order_id") or _cb_get(order, "order_id")
+
+        # Wait for fill
+        o = {}
+        waited = 0
+        while waited < LIMIT_BUY_WAIT:
+            time.sleep(5); waited += 5
+            try:
+                o = _cb_get(client.get_order(order_id), "order", {})
+                if _cb_get(o, "status") == "FILLED":
+                    break
+            except Exception as e:
+                log(f"  Fill check error: {e}")
+
+        if _cb_get(o, "status") != "FILLED":
+            try:
+                client.cancel_orders(order_ids=[order_id])
+            except Exception as e:
+                log(f"  Cancel error: {e}")
+            time.sleep(1)
+            try:
+                o = _cb_get(client.get_order(order_id), "order", {})
+            except Exception:
+                pass
+
+        filled = float(_cb_get(o, "filled_size", 0) or 0)
+        if filled <= 0:
+            log(f"  ⏭️ LIMIT BUY didn't fill in {LIMIT_BUY_WAIT}s — cancelled, no trade")
+            return None
+
+        avg = float(_cb_get(o, "average_filled_price", 0) or 0) or float(limit_price)
+        spent = float(_cb_get(o, "total_value_after_fees", 0) or 0) or filled * avg * (1 + MAKER_FEE)
+        log(f"  ✅ BOUGHT {filled} {product_id.split('-')[0]} @ ${avg:.4f} (${spent:.2f} USDC) — ID: {str(order_id)[:8]}")
+        return {"order_id": order_id, "filled_size": filled, "avg_price": avg, "spent": spent}
+    except Exception as e:
+        log(f"  Limit buy error: {e}")
         return None
 
 def get_coinbase_order(order_id):
@@ -816,6 +905,16 @@ TECHNICAL DATA for {market}:
         mode_note = "LIVE TRADING on Coinbase SPOT — real money. You can ONLY go LONG (buy). Never suggest short. Find oversold/dip buying opportunities." if LIVE_TRADING else \
                     "Paper trading mode — simulate realistic trades."
 
+        cost_note = """
+COSTS: each round trip costs about 1% in fees. Stop loss is -2%, and winners are held with a trailing stop once up 3%.
+Only say trade=true if you expect at least a 3% move up soon. Small or unclear setups lose money after fees — skip them.
+
+CONFIDENCE (this sets how much money goes in):
+- high = 3+ strong bullish signals that agree, INCLUDING volume above 1.0x. Trade size 20%.
+- medium = 2 solid bullish signals. Trade size 10%.
+- low = anything weaker. Low is never traded, so if it's low just say trade=false.
+""" if LIVE_TRADING else ""
+
         prompt = f"""You are an expert crypto trading bot. {mode_note}
 
 {data_str}
@@ -834,7 +933,7 @@ Since we can ONLY BUY on Coinbase spot, look for LONG opportunities:
 
 If conditions are neutral or bearish — say trade=false and wait.
 Only trade when you see 1.5+ BULLISH signals.
-
+{cost_note}
 JSON only: {{"trade": true/false, "side": "long", "confidence": "low"/"medium"/"high", "reason": "cite bullish signals"}}"""
 
         r = requests.post("https://api.anthropic.com/v1/messages",
@@ -910,6 +1009,17 @@ def close_live_position(position_id, exit_reason):
     )
     return r.ok
 
+def update_stop_price(position_id, new_stop):
+    """Save the raised trailing stop so it survives restarts"""
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/live_positions?id=eq.{position_id}",
+            json={"stop_loss_price": new_stop},
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                     "Content-Type": "application/json", "Prefer": "return=minimal"})
+    except Exception as e:
+        log(f"  Stop update error: {e}")
+
 def check_and_close_positions(user_id, prices):
     """Check all open positions and close if TP or SL hit"""
     positions = get_open_positions(user_id)
@@ -934,13 +1044,20 @@ def check_and_close_positions(user_id, prices):
         if current_price <= 0:
             continue
 
+        # Trailing stop: once up TAKE_PROFIT_PCT, keep raising the stop under the price
+        if entry_price > 0 and current_price >= entry_price * (1 + TAKE_PROFIT_PCT):
+            new_stop = round(current_price * (1 - TRAIL_GAP_PCT), 6)
+            if new_stop > sl_price:
+                sl_price = new_stop
+                update_stop_price(pos_id, new_stop)
+                gain = (current_price / entry_price - 1) * 100
+                log(f"  📈 {market} +{gain:.1f}% — trailing stop raised to ${new_stop:.4f} (locks ~{(new_stop/entry_price-1)*100:+.1f}%)")
+
         exit_reason = None
         if FORCE_CLOSE_ON_START and user_id not in _force_closed_users:
             exit_reason = "force close"
-        elif current_price >= tp_price:
-            exit_reason = "take profit"
         elif current_price <= sl_price:
-            exit_reason = "stop loss"
+            exit_reason = "trailing stop" if sl_price > entry_price else "stop loss"
 
         if exit_reason:
             log(f"  🎯 {market} hit {exit_reason} @ ${current_price:.4f} (entry: ${entry_price:.4f})")
@@ -1017,11 +1134,10 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
         # Live balance is real USDC, so size is already USDC
         size_usdc = size_cad
         log(f"  💵 LIVE BUY: {product_id} ${size_usdc:.2f} USDC")
-        order = place_coinbase_order(product_id, "long", size_usdc)
+        order = place_limit_buy(product_id, size_usdc)
 
         if not order:
-            log(f"  ❌ Live order failed")
-            return None, None, None, "order failed"
+            return None, None, None, "buy didn't fill"
 
         # Use the real fill when we have it, otherwise estimate
         if order.get("filled_size") and order.get("avg_price"):
@@ -1081,8 +1197,13 @@ def get_volatility(market_data):
 
 def get_trade_size(base_pct, confidence, balance, market_data=None, fear_greed=None):
     """Dynamic trade size based on confidence, volatility and fear/greed"""
-    # Start with confidence adjustment
-    if confidence == "high":
+    # Live: size by confidence (low never trades)
+    if LIVE_TRADING:
+        pct = LIVE_SIZE_PCT.get(confidence, 0)
+        if pct <= 0:
+            return 0
+    # Paper: old sizing
+    elif confidence == "high":
         pct = min(base_pct + 5, 25)
     elif confidence == "low":
         pct = max(base_pct - 5, 5)
@@ -1112,7 +1233,7 @@ def get_trade_size(base_pct, confidence, balance, market_data=None, fear_greed=N
 
     # Live mode cap
     if LIVE_TRADING:
-        pct = min(pct, 10)
+        pct = min(pct, 25)
 
     pct = max(3, min(pct, 30))  # hard limits: 3% min, 30% max
     return balance * (pct / 100)
@@ -1357,15 +1478,15 @@ def main():
     log(f"   Claude AI: {'ENABLED ✓' if ANTHROPIC_KEY else 'fallback'}")
     log(f"   Scan: {SCAN_INTERVAL}s | Markets per scan: {MARKETS_PER_SCAN} of {len(MARKETS)}")
     log(f"   Fee: {TRADING_FEE*100:.2f}% | Slippage: {SLIPPAGE*100:.1f}%")
-    log(f"   SL: {STOP_LOSS_PCT*100:.1f}% | TP: {TAKE_PROFIT_PCT*100:.1f}% | Hard stop: ${HARD_STOP_BALANCE}")
-    log(f"   Max daily loss: ${MAX_DAILY_LOSS_CAD} CAD")
+    log(f"   SL: {STOP_LOSS_PCT*100:.1f}% | Trailing stop from +{TAKE_PROFIT_PCT*100:.1f}% ({TRAIL_GAP_PCT*100:.1f}% gap) | Hard stop: ${HARD_STOP_BALANCE}")
+    log(f"   Max daily loss: ${MAX_DAILY_LOSS_CAD} {'USDC' if LIVE_TRADING else 'CAD'}")
 
     # Test Coinbase connection
     if COINBASE_API_KEY:
         log("   Testing Coinbase connection...")
         bal = get_coinbase_balance()
         if bal is not None:
-            log(f"   Coinbase: CONNECTED ✓ | Real balance: ${bal:.2f} CAD")
+            log(f"   Coinbase: CONNECTED ✓ | Real balance: ${bal:.2f} USDC")
             if LIVE_TRADING and bal < 5:
                 log(f"   ⚠️ WARNING: Coinbase balance too low — deposit funds first")
             # List available CAD pairs to verify
@@ -1441,6 +1562,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ---- PLACEHOLDER TO VERIFY FILE EXISTS ----
-# Will be replaced with full rewrite
