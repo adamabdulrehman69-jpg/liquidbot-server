@@ -1,4 +1,4 @@
-import time
+=import time
 import random
 import requests
 import os
@@ -742,6 +742,104 @@ JSON only: {{"trade": true/false, "side": "long", "confidence": "low"/"medium"/"
         log(f"  Claude error: {e}")
         return {"trade": False, "side": "long", "confidence": "low", "reason": "Error"}
 
+# ---- LIVE POSITION TRACKING ----
+def save_live_position(user_id, market, product_id, entry_price, amount_coin, size_usdc):
+    """Save an open live position to Supabase"""
+    sl_price = round(entry_price * (1 - STOP_LOSS_PCT), 6)
+    tp_price = round(entry_price * (1 + TAKE_PROFIT_PCT), 6)
+    supa_post("live_positions", {
+        "user_id": user_id,
+        "market": market,
+        "product_id": product_id,
+        "side": "long",
+        "entry_price": entry_price,
+        "amount_coin": amount_coin,
+        "size_usdc": size_usdc,
+        "stop_loss_price": sl_price,
+        "take_profit_price": tp_price,
+        "status": "open"
+    })
+    log(f"  📝 Position saved: {market} entry=${entry_price} SL=${sl_price} TP=${tp_price}")
+
+def get_open_positions(user_id):
+    """Get all open live positions"""
+    rows = supa_get("live_positions", f"user_id=eq.{user_id}&status=eq.open&select=*")
+    return rows if isinstance(rows, list) else []
+
+def close_live_position(position_id, exit_reason):
+    """Mark a position as closed"""
+    r = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/live_positions?id=eq.{position_id}",
+        json={"status": "closed", "opened_at": datetime.now(timezone.utc).isoformat()},
+        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                 "Content-Type": "application/json", "Prefer": "return=minimal"}
+    )
+    return r.ok
+
+def check_and_close_positions(user_id, prices):
+    """Check all open positions and close if TP or SL hit"""
+    positions = get_open_positions(user_id)
+    if not positions:
+        return 0, 0  # pnl, closed_count
+
+    total_pnl = 0
+    closed = 0
+
+    for pos in positions:
+        market = pos.get("market")
+        product_id = pos.get("product_id")
+        entry_price = float(pos.get("entry_price", 0))
+        amount_coin = float(pos.get("amount_coin", 0))
+        size_usdc = float(pos.get("size_usdc", 0))
+        sl_price = float(pos.get("stop_loss_price", 0))
+        tp_price = float(pos.get("take_profit_price", 0))
+        pos_id = pos.get("id")
+
+        # Get current price
+        current_price = float(prices.get(market, 0))
+        if current_price <= 0:
+            continue
+
+        exit_reason = None
+        if current_price >= tp_price:
+            exit_reason = "take profit"
+        elif current_price <= sl_price:
+            exit_reason = "stop loss"
+
+        if exit_reason:
+            log(f"  🎯 {market} hit {exit_reason} @ ${current_price:.4f} (entry: ${entry_price:.4f})")
+            # Place real sell order
+            client = get_coinbase_client()
+            if client:
+                try:
+                    import uuid
+                    sell_order = client.market_order_sell(
+                        client_order_id=str(uuid.uuid4()),
+                        product_id=product_id,
+                        base_size=str(round(amount_coin, 6))
+                    )
+                    log(f"  ✅ SELL order placed: {product_id} {amount_coin:.6f} coins")
+                except Exception as e:
+                    log(f"  ❌ Sell order error: {e}")
+
+            # Calculate real P&L
+            pnl = round((current_price - entry_price) / entry_price * size_usdc, 4)
+            fee_cost = round(size_usdc * TRADING_FEE * 2, 4)
+            net_pnl = round(pnl - fee_cost, 4)
+            total_pnl += net_pnl
+            closed += 1
+
+            close_live_position(pos_id, exit_reason)
+            supa_post("alerts", {
+                "user_id": user_id,
+                "type": "win" if net_pnl > 0 else "loss",
+                "title": f"🔴 LIVE {market} SOLD — {'WIN ✓' if net_pnl > 0 else 'LOSS ✗'}",
+                "description": f"Exit: {exit_reason} @ ${current_price:.4f} | P&L: {'+' if net_pnl >= 0 else ''}${net_pnl:.4f} USDC"
+            })
+            log(f"  {'WIN' if net_pnl > 0 else 'LOSS'}: {market} P&L = {'+' if net_pnl >= 0 else ''}${net_pnl:.4f} USDC")
+
+    return total_pnl, closed
+
 # ---- EXECUTE TRADE (paper or live) ----
 def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance, price, price_str):
     """Execute a trade — paper simulation or real Coinbase order"""
@@ -749,40 +847,40 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
     slip = SLIPPAGE
 
     if LIVE_TRADING and COINBASE_API_KEY:
-        # Skip only LOW confidence in live mode
+        # Skip LOW confidence
         if confidence == "low":
-            log(f"  🔒 LIVE MODE: skipping low confidence trade")
+            log(f"  🔒 LIVE MODE: skipping low confidence")
             return None, None, None, "skipped — low confidence"
 
-        # Coinbase spot only supports BUY (long) — can't short
+        # Coinbase spot only supports BUY
         if side == "short":
-            log(f"  🔒 LIVE MODE: skipping SHORT — Coinbase spot only supports BUY")
-            return None, None, None, "skipped — no shorting on Coinbase spot"
+            log(f"  🔒 LIVE MODE: skipping SHORT — spot only supports BUY")
+            return None, None, None, "skipped — no shorting"
 
-        # Check if market is available on Coinbase
         product_id = COINBASE_PAIRS.get(market)
         if not product_id:
-            log(f"  {market} not available on Coinbase CAD pairs — falling back to paper")
-            # Fall through to paper simulation below
-        else:
-            log(f"  💵 LIVE ORDER: {product_id} {side.upper()} ${size_cad:.2f} USDC")
-            order = place_coinbase_order(product_id, side, size_cad * 0.72)  # CAD to USDC
+            log(f"  {market} not in Coinbase pairs — skipping")
+            return None, None, None, "market not on Coinbase"
 
-            if not order:
-                log(f"  ❌ Live order failed — not falling back to paper")
-                return None, None, None, "order failed"
-            else:
-                # Real order placed — estimate P&L
-                notional = size_cad
-                fee_cost = notional * fee * 2
-                slip_cost = notional * slip
-                win_prob = 0.58 if confidence == "high" else 0.52
-                won = random.random() < win_prob
-                gross = notional * random.uniform(0.008, TAKE_PROFIT_PCT) if won else -notional * random.uniform(0.005, STOP_LOSS_PCT)
-                pnl = round(gross - fee_cost - slip_cost, 4)
-                exit_reason = "take profit" if won else "stop loss"
-                fees = round(fee_cost + slip_cost, 4)
-                return pnl, fees, exit_reason, "live order placed ✅"
+        # Use USDC size directly
+        size_usdc = size_cad * 0.72
+        log(f"  💵 LIVE BUY: {product_id} ${size_usdc:.2f} USDC")
+        order = place_coinbase_order(product_id, "long", size_usdc)
+
+        if not order:
+            log(f"  ❌ Live order failed")
+            return None, None, None, "order failed"
+
+        # Calculate amount of coin bought
+        amount_coin = round(size_usdc / price, 6)
+        fee_cost = round(size_usdc * fee, 4)
+
+        # Save position for automatic exit later
+        save_live_position(user_id, market, product_id, price, amount_coin, size_usdc)
+
+        # Return 0 P&L for now — actual P&L comes when position closes
+        log(f"  📈 Position opened: {amount_coin:.6f} {market} @ ${price:.4f} | TP: ${price*(1+TAKE_PROFIT_PCT):.4f} | SL: ${price*(1-STOP_LOSS_PCT):.4f}")
+        return 0, fee_cost, "position opened", "live order placed ✅"
 
     else:
         # Paper simulation with trailing stop loss
@@ -923,6 +1021,22 @@ def scan_for_user(user, prices, do_learning):
             log(f"  🧠 Restored insights from Supabase")
 
     learning_context = user_learning.get(user_id, "")
+
+    # Check and close any open live positions first
+    if LIVE_TRADING:
+        pos_pnl, pos_closed = check_and_close_positions(user_id, prices)
+        if pos_closed > 0:
+            balance = max(0, balance + pos_pnl)
+            total_pnl += pos_pnl
+            log(f"  Closed {pos_closed} position(s) | P&L: {'+' if pos_pnl >= 0 else ''}${pos_pnl:.4f} | Balance: ${balance:.2f}")
+
+    # Don't open new position if we already have one open
+    if LIVE_TRADING:
+        open_pos = get_open_positions(user_id)
+        if open_pos:
+            log(f"  ⏳ {len(open_pos)} position(s) open — waiting for exit before new trade")
+            save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leverage, risk)
+            return
 
     # Select markets
     available = [m for m in MARKETS if m in prices]
