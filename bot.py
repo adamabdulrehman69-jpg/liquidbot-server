@@ -651,7 +651,7 @@ TECHNICAL DATA for {market}:
         threshold = "1 strong signal or 2 moderate" if risk == "High" else \
                     "1.5 confirming signals" if risk == "Medium" else "2+ signals"
 
-        mode_note = "⚠️ LIVE TRADING MODE — real money at risk. Be more conservative." if LIVE_TRADING else \
+        mode_note = "LIVE TRADING — real money. Trade medium or high confidence setups with 1.5+ signals." if LIVE_TRADING else \
                     "Paper trading mode — simulate realistic trades."
 
         prompt = f"""You are an expert crypto trading bot. {mode_note}
@@ -670,8 +670,8 @@ Signals:
 - Fear & Greed <25 = extreme fear = contrarian BUY signal
 - Fear & Greed >75 = extreme greed = contrarian SELL/SHORT signal
 
-Apply self-learning. Be willing to trade on moderate setups.
-{"In LIVE mode, only trade HIGH confidence setups." if LIVE_TRADING else ""}
+Apply self-learning. Trade when you have 1.5+ confirming signals.
+In LIVE mode, medium confidence is acceptable. Do NOT require HIGH confidence only.
 
 JSON only: {{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "cite signals"}}"""
 
@@ -721,10 +721,10 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
     slip = SLIPPAGE
 
     if LIVE_TRADING and COINBASE_API_KEY:
-        # Only trade HIGH or MEDIUM confidence in live mode
+        # Skip only LOW confidence in live mode
         if confidence == "low":
             log(f"  🔒 LIVE MODE: skipping low confidence trade")
-            return None, None, None, "skipped — low confidence in live mode"
+            return None, None, None, "skipped — low confidence"
 
         # Check if market is available on Coinbase
         product_id = COINBASE_PAIRS.get(market)
