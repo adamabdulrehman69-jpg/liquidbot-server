@@ -156,13 +156,22 @@ def place_coinbase_order(product_id, side, size_cad):
             return None
 
         order_id = str(uuid.uuid4())
-        log(f"  Placing order: {product_id} {side.upper()} ${size_cad:.2f} CAD")
-        order = client.market_order(
-            client_order_id=order_id,
-            product_id=product_id,
-            side="BUY" if side == "long" else "SELL",
-            quote_size=str(round(size_cad, 2))
-        )
+        log(f"  Placing order: {product_id} BUY ${size_cad:.2f} USDC")
+        try:
+            # Try market_order_buy specifically for buying with quote currency
+            order = client.market_order_buy(
+                client_order_id=order_id,
+                product_id=product_id,
+                quote_size=str(round(size_cad, 2))
+            )
+        except AttributeError:
+            # Fallback to market_order if market_order_buy not available
+            order = client.market_order(
+                client_order_id=order_id,
+                product_id=product_id,
+                side="BUY",
+                quote_size=str(round(size_cad, 2))
+            )
 
         if order and (hasattr(order, 'success') and order.success or
                       isinstance(order, dict) and order.get('success')):
@@ -726,6 +735,11 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
             log(f"  🔒 LIVE MODE: skipping low confidence trade")
             return None, None, None, "skipped — low confidence"
 
+        # Coinbase spot only supports BUY (long) — can't short
+        if side == "short":
+            log(f"  🔒 LIVE MODE: skipping SHORT — Coinbase spot only supports BUY")
+            return None, None, None, "skipped — no shorting on Coinbase spot"
+
         # Check if market is available on Coinbase
         product_id = COINBASE_PAIRS.get(market)
         if not product_id:
@@ -736,8 +750,8 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
             order = place_coinbase_order(product_id, side, size_cad * 0.72)  # CAD to USDC
 
             if not order:
-                log(f"  ❌ Live order failed — falling back to paper simulation")
-                # Fall through to paper simulation
+                log(f"  ❌ Live order failed — not falling back to paper")
+                return None, None, None, "order failed"
             else:
                 # Real order placed — estimate P&L
                 notional = size_cad
