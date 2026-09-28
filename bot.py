@@ -6,6 +6,8 @@ import json
 import threading
 import hmac
 import hashlib
+import uuid
+import math
 from datetime import datetime, timezone
 from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -51,6 +53,8 @@ STOP_LOSS_PCT = 0.025
 TAKE_PROFIT_PCT = 0.035
 HARD_STOP_BALANCE = 35.0    # stop if balance drops below $35 (50% of starting USDC)
 MARKETS_PER_SCAN = 3
+FORCE_CLOSE_ON_START = os.environ.get("FORCE_CLOSE_ON_START", "false").lower() == "true"  # sells all open positions once per boot
+_force_closed_users = set()
 
 # Top markets with good Hyperliquid data
 MARKETS = [
@@ -209,10 +213,116 @@ def get_coinbase_order(order_id):
     """Check status of a placed order"""
     return coinbase_request("GET", f"/api/v3/brokerage/orders/historical/{order_id}")
 
-def close_coinbase_position(product_id, side, size_usd):
-    """Close an existing position by placing opposite order"""
-    close_side = "short" if side == "long" else "long"
-    return place_coinbase_order(product_id, close_side, size_usd)
+# ---- SELL SYSTEM (base_size) ----
+_product_cache = {}
+
+def _cb_get(obj, key, default=None):
+    """Read a field from an SDK response object or a dict"""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    val = getattr(obj, key, None)
+    if val is None:
+        try:
+            val = obj[key]
+        except Exception:
+            val = None
+    return default if val is None else val
+
+def get_product_rules(client, product_id):
+    """base_increment + base_min_size for a pair (cached)"""
+    if product_id not in _product_cache:
+        p = client.get_product(product_id)
+        _product_cache[product_id] = {
+            "base_increment": str(_cb_get(p, "base_increment", "0.00000001")),
+            "base_min_size": float(_cb_get(p, "base_min_size", 0) or 0),
+        }
+    return _product_cache[product_id]
+
+def get_coin_balance(client, currency):
+    """Real available coin balance on Coinbase (e.g. 'LINK' -> 0.3921)"""
+    cursor = None
+    while True:
+        resp = client.get_accounts(limit=250, cursor=cursor) if cursor else client.get_accounts(limit=250)
+        for acc in _cb_get(resp, "accounts", []) or []:
+            if _cb_get(acc, "currency") == currency:
+                bal = _cb_get(acc, "available_balance", {})
+                return float(_cb_get(bal, "value", 0) or 0)
+        if not _cb_get(resp, "has_next", False):
+            return 0.0
+        cursor = _cb_get(resp, "cursor")
+
+def floor_to_increment(amount, increment):
+    """Round DOWN to the pair's step size, returned as a string Coinbase accepts"""
+    inc = float(increment)
+    decimals = len((increment.split(".")[1] if "." in increment else "").rstrip("0"))
+    steps = math.floor(amount / inc + 1e-9)
+    return f"{steps * inc:.{decimals}f}"
+
+def sell_coinbase_position(product_id, max_coin=None):
+    """
+    Market SELL using base_size (coin amount), never quote_size.
+    Uses the real Coinbase balance so fees/rounding can't cause INSUFFICIENT_FUND.
+    Returns dict: {"status": "sold"|"nothing_to_sell"|"failed", ...}
+    """
+    client = get_coinbase_client()
+    if not client:
+        return {"status": "failed", "error": "no Coinbase client"}
+    try:
+        base_currency = product_id.split("-")[0]
+        rules = get_product_rules(client, product_id)
+        balance = get_coin_balance(client, base_currency)
+
+        # Only sell what this position holds (never touch coins held outside the bot)
+        amount = min(balance, max_coin) if max_coin else balance
+        base_size = floor_to_increment(amount, rules["base_increment"])
+
+        if float(base_size) <= 0 or float(base_size) < rules["base_min_size"]:
+            log(f"  ⚠️ {product_id}: sellable {base_size} {base_currency} below min {rules['base_min_size']} (balance {balance})")
+            return {"status": "nothing_to_sell", "balance": balance}
+
+        log(f"  Placing SELL: {product_id} {base_size} {base_currency} (balance {balance})")
+        order = client.market_order_sell(
+            client_order_id=str(uuid.uuid4()),
+            product_id=product_id,
+            base_size=base_size
+        )
+
+        if not _cb_get(order, "success", False):
+            err = _cb_get(order, "error_response", {})
+            reason = f"{_cb_get(err, 'error', '')} {_cb_get(err, 'message', '')} {_cb_get(err, 'preview_failure_reason', '')}".strip()
+            log(f"  ❌ SELL rejected: {product_id} — {reason or order}")
+            return {"status": "failed", "error": reason or str(order)}
+
+        order_id = _cb_get(_cb_get(order, "success_response", {}), "order_id") or _cb_get(order, "order_id")
+
+        # Get real fill numbers (IOC fills almost instantly, retry briefly)
+        fill = {}
+        for _ in range(3):
+            try:
+                o = _cb_get(client.get_order(order_id), "order", {})
+                if _cb_get(o, "status") in ("FILLED", "CANCELLED", "EXPIRED", "FAILED"):
+                    fill = {
+                        "avg_price": float(_cb_get(o, "average_filled_price", 0) or 0),
+                        "filled_size": float(_cb_get(o, "filled_size", 0) or 0),
+                        "filled_value": float(_cb_get(o, "filled_value", 0) or 0),
+                        "fees": float(_cb_get(o, "total_fees", 0) or 0),
+                    }
+                    break
+            except Exception as e:
+                log(f"  Fill lookup error: {e}")
+            time.sleep(1)
+
+        log(f"  ✅ SOLD {product_id} {base_size} {base_currency} @ ${fill.get('avg_price', 0):.4f} — ID: {str(order_id)[:8]}")
+        return {"status": "sold", "order_id": order_id, "base_size": base_size, **fill}
+    except Exception as e:
+        log(f"  ❌ SELL error: {product_id} — {e}")
+        return {"status": "failed", "error": str(e)}
+
+def close_coinbase_position(product_id, side, size_usd=None, max_coin=None):
+    """Close a long spot position (sell by coin amount)"""
+    return sell_coinbase_position(product_id, max_coin=max_coin)
 
 # ---- DAILY LOSS TRACKING ----
 def check_daily_loss(user_id, pnl):
@@ -770,7 +880,7 @@ def close_live_position(position_id, exit_reason):
     """Mark a position as closed"""
     r = requests.patch(
         f"{SUPABASE_URL}/rest/v1/live_positions?id=eq.{position_id}",
-        json={"status": "closed", "opened_at": datetime.now(timezone.utc).isoformat()},
+        json={"status": "closed"},
         headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                  "Content-Type": "application/json", "Prefer": "return=minimal"}
     )
@@ -801,31 +911,39 @@ def check_and_close_positions(user_id, prices):
             continue
 
         exit_reason = None
-        if current_price >= tp_price:
+        if FORCE_CLOSE_ON_START and user_id not in _force_closed_users:
+            exit_reason = "force close"
+        elif current_price >= tp_price:
             exit_reason = "take profit"
         elif current_price <= sl_price:
             exit_reason = "stop loss"
 
         if exit_reason:
             log(f"  🎯 {market} hit {exit_reason} @ ${current_price:.4f} (entry: ${entry_price:.4f})")
-            # Place real sell order
-            client = get_coinbase_client()
-            if client:
-                try:
-                    import uuid
-                    sell_order = client.market_order_sell(
-                        client_order_id=str(uuid.uuid4()),
-                        product_id=product_id,
-                        base_size=str(round(amount_coin, 6))
-                    )
-                    log(f"  ✅ SELL order placed: {product_id} {amount_coin:.6f} coins")
-                except Exception as e:
-                    log(f"  ❌ Sell order error: {e}")
+            # Real SELL by coin amount (base_size), capped at what this position bought
+            result = sell_coinbase_position(product_id, max_coin=amount_coin)
 
-            # Calculate real P&L
-            pnl = round((current_price - entry_price) / entry_price * size_usdc, 4)
-            fee_cost = round(size_usdc * TRADING_FEE * 2, 4)
-            net_pnl = round(pnl - fee_cost, 4)
+            if result["status"] == "failed":
+                # Keep position open so the next scan retries
+                log(f"  ⏳ {market} still open — will retry sell next scan")
+                continue
+
+            if result["status"] == "nothing_to_sell":
+                # Coins already gone (sold manually) or just dust — stop tracking it
+                log(f"  🧹 {market}: nothing left to sell — marking closed")
+                close_live_position(pos_id, "nothing to sell")
+                closed += 1
+                continue
+
+            # Real P&L from the fill if we got it, otherwise estimate
+            if result.get("filled_value"):
+                net_pnl = round(result["filled_value"] - result.get("fees", 0) - size_usdc, 4)
+                if result.get("avg_price"):
+                    current_price = result["avg_price"]
+            else:
+                pnl = round((current_price - entry_price) / entry_price * size_usdc, 4)
+                fee_cost = round(size_usdc * TRADING_FEE * 2, 4)
+                net_pnl = round(pnl - fee_cost, 4)
             total_pnl += net_pnl
             closed += 1
 
@@ -838,6 +956,8 @@ def check_and_close_positions(user_id, prices):
             })
             log(f"  {'WIN' if net_pnl > 0 else 'LOSS'}: {market} P&L = {'+' if net_pnl >= 0 else ''}${net_pnl:.4f} USDC")
 
+    if FORCE_CLOSE_ON_START:
+        _force_closed_users.add(user_id)
     return total_pnl, closed
 
 # ---- EXECUTE TRADE (paper or live) ----
