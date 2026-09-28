@@ -660,7 +660,7 @@ TECHNICAL DATA for {market}:
         threshold = "1 strong signal or 2 moderate" if risk == "High" else \
                     "1.5 confirming signals" if risk == "Medium" else "2+ signals"
 
-        mode_note = "LIVE TRADING — real money. Trade medium or high confidence setups with 1.5+ signals." if LIVE_TRADING else \
+        mode_note = "LIVE TRADING on Coinbase SPOT — real money. You can ONLY go LONG (buy). Never suggest short. Find oversold/dip buying opportunities." if LIVE_TRADING else \
                     "Paper trading mode — simulate realistic trades."
 
         prompt = f"""You are an expert crypto trading bot. {mode_note}
@@ -668,21 +668,21 @@ TECHNICAL DATA for {market}:
 {data_str}
 {learning_context}
 
-Risk: {risk} | Leverage: {leverage}x | Threshold: {threshold}
+Risk: {risk} | Threshold: {threshold}
 
-Signals:
-- RSI <35/>65 = strong | RSI <40/>60 = moderate
-- Volume >1.2x = strong confirmation | >0.8x = moderate
-- Funding negative = bullish | positive = bearish  
-- OB ratio >1.2 = bullish | <0.8 = bearish
-- Trend direction adds 0.5 signal
-- Fear & Greed <25 = extreme fear = contrarian BUY signal
-- Fear & Greed >75 = extreme greed = contrarian SELL/SHORT signal
+Since we can ONLY BUY on Coinbase spot, look for LONG opportunities:
+- RSI <40 = oversold = BUY signal (strong if <30)
+- Price at low end of 24h range (<30%) = good entry
+- Volume >1.0x = confirms move
+- Uptrend (above SMA5 and SMA10) = BUY signal
+- Funding negative = bullish = BUY signal
+- OB ratio >1.1 = more buyers = BUY signal
+- Fear & Greed <40 = fear = contrarian BUY
 
-Apply self-learning. Trade when you have 1.5+ confirming signals.
-In LIVE mode, medium confidence is acceptable. Do NOT require HIGH confidence only.
+If conditions are neutral or bearish — say trade=false and wait.
+Only trade when you see 1.5+ BULLISH signals.
 
-JSON only: {{"trade": true/false, "side": "long"/"short", "confidence": "low"/"medium"/"high", "reason": "cite signals"}}"""
+JSON only: {{"trade": true/false, "side": "long", "confidence": "low"/"medium"/"high", "reason": "cite bullish signals"}}"""
 
         r = requests.post("https://api.anthropic.com/v1/messages",
             json={"model": "claude-haiku-4-5-20251001", "max_tokens": 200,
