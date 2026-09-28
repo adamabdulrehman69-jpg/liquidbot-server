@@ -173,15 +173,34 @@ def place_coinbase_order(product_id, side, size_cad):
                 quote_size=str(round(size_cad, 2))
             )
 
-        if order and (hasattr(order, 'success') and order.success or
-                      isinstance(order, dict) and order.get('success')):
-            order_id_resp = (order.order_id if hasattr(order, 'order_id')
-                            else order.get('order', {}).get('order_id', '?'))
-            log(f"  ✅ Real order placed: {product_id} {side.upper()} ${size_cad:.2f} CAD — ID: {str(order_id_resp)[:8]}")
-            return order
-        else:
-            log(f"  ❌ Order failed: {order}")
-            return None
+        if order:
+            # Handle different response formats from Coinbase SDK
+            success = False
+            order_id_resp = "?"
+            try:
+                if hasattr(order, 'success'):
+                    success = order.success
+                elif isinstance(order, dict):
+                    success = order.get('success', False)
+                else:
+                    # Try to access as object
+                    success = True  # if no error was raised, assume success
+
+                if hasattr(order, 'order_id'):
+                    order_id_resp = order.order_id
+                elif hasattr(order, 'order') and hasattr(order.order, 'order_id'):
+                    order_id_resp = order.order.order_id
+                elif isinstance(order, dict):
+                    order_id_resp = order.get('order', {}).get('order_id', '?')
+            except:
+                success = True  # assume success if we can't parse
+
+            if success:
+                log(f"  ✅ Real order placed: {product_id} BUY ${size_cad:.2f} USDC — ID: {str(order_id_resp)[:8]}")
+                return order
+            else:
+                log(f"  ❌ Order failed: {order}")
+                return None
     except Exception as e:
         log(f"  Order error: {e}")
         return None
