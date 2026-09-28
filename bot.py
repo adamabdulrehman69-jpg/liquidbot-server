@@ -179,34 +179,34 @@ def place_coinbase_order(product_id, side, size_cad):
                 quote_size=str(round(size_cad, 2))
             )
 
-        if order:
-            # Handle different response formats from Coinbase SDK
-            success = False
-            order_id_resp = "?"
+        # Real success check — no more "assume success"
+        if not _cb_get(order, "success", False):
+            err = _cb_get(order, "error_response", {})
+            reason = f"{_cb_get(err, 'error', '')} {_cb_get(err, 'message', '')} {_cb_get(err, 'preview_failure_reason', '')}".strip()
+            log(f"  ❌ BUY rejected: {product_id} — {reason or order}")
+            return None
+
+        order_id_resp = _cb_get(_cb_get(order, "success_response", {}), "order_id") or _cb_get(order, "order_id", "?")
+
+        # Real fill: exact coins received + real entry price
+        fill = {}
+        for _ in range(3):
             try:
-                if hasattr(order, 'success'):
-                    success = order.success
-                elif isinstance(order, dict):
-                    success = order.get('success', False)
-                else:
-                    # Try to access as object
-                    success = True  # if no error was raised, assume success
+                o = _cb_get(client.get_order(order_id_resp), "order", {})
+                if _cb_get(o, "status") == "FILLED":
+                    fill = {
+                        "avg_price": float(_cb_get(o, "average_filled_price", 0) or 0),
+                        "filled_size": float(_cb_get(o, "filled_size", 0) or 0),
+                        "spent": float(_cb_get(o, "total_value_after_fees", 0) or 0) or float(size_cad),
+                    }
+                    break
+            except Exception as e:
+                log(f"  Fill lookup error: {e}")
+            time.sleep(1)
 
-                if hasattr(order, 'order_id'):
-                    order_id_resp = order.order_id
-                elif hasattr(order, 'order') and hasattr(order.order, 'order_id'):
-                    order_id_resp = order.order.order_id
-                elif isinstance(order, dict):
-                    order_id_resp = order.get('order', {}).get('order_id', '?')
-            except:
-                success = True  # assume success if we can't parse
-
-            if success:
-                log(f"  ✅ Real order placed: {product_id} BUY ${size_cad:.2f} USDC — ID: {str(order_id_resp)[:8]}")
-                return order
-            else:
-                log(f"  ❌ Order failed: {order}")
-                return None
+        log(f"  ✅ Real order placed: {product_id} BUY ${size_cad:.2f} USDC — ID: {str(order_id_resp)[:8]}"
+            + (f" | got {fill['filled_size']} @ ${fill['avg_price']:.4f}" if fill else " | fill not confirmed yet"))
+        return {"order_id": order_id_resp, "size_usdc": size_cad, **fill}
     except Exception as e:
         log(f"  Order error: {e}")
         return None
@@ -1023,8 +1023,13 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
             log(f"  ❌ Live order failed")
             return None, None, None, "order failed"
 
-        # Calculate amount of coin bought
-        amount_coin = round(size_usdc / price, 6)
+        # Use the real fill when we have it, otherwise estimate
+        if order.get("filled_size") and order.get("avg_price"):
+            amount_coin = order["filled_size"]
+            price = order["avg_price"]
+            size_usdc = order.get("spent", size_usdc)
+        else:
+            amount_coin = round(size_usdc / price, 6)
         fee_cost = round(size_usdc * fee, 4)
 
         # Save position for automatic exit later
