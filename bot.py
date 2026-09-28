@@ -55,6 +55,8 @@ HARD_STOP_BALANCE = 35.0    # stop if balance drops below $35 (50% of starting U
 MARKETS_PER_SCAN = 3
 FORCE_CLOSE_ON_START = os.environ.get("FORCE_CLOSE_ON_START", "false").lower() == "true"  # sells all open positions once per boot
 _force_closed_users = set()
+INSIGHT_KEY = "live" if LIVE_TRADING else "main"   # live learning never mixes with paper learning
+open_trade_meta = {}   # (user_id, market) -> confidence/reason from when the position opened
 
 # Top markets with good Hyperliquid data
 MARKETS = [
@@ -381,12 +383,12 @@ def save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leve
     r = requests.patch(f"{SUPABASE_URL}/rest/v1/bot_settings?user_id=eq.{user_id}",
         json={"balance_cad": round(balance, 4), "total_pnl_cad": round(total_pnl, 4),
               "trade_count": trade_count, "trade_size_pct": trade_size_pct,
-              "leverage": leverage, "risk": risk, "bot_enabled": True,
+              "leverage": leverage, "risk": risk,
               "updated_at": datetime.now(timezone.utc).isoformat()},
         headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                  "Content-Type": "application/json", "Prefer": "return=minimal"})
     if r.ok:
-        log(f"  Saved — balance: ${balance:.2f} CAD")
+        log(f"  Saved — balance: ${balance:.2f} {'USDC' if LIVE_TRADING else 'CAD'}")
     else:
         log(f"  Save failed: {r.status_code}")
 
@@ -523,9 +525,31 @@ def fetch_orderbook(market):
 
 # ---- IMPROVED PERSISTENT SELF LEARNING ----
 def get_trade_history(user_id, limit=100):
-    """Get more trades for better pattern analysis"""
-    rows = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit={limit}&select=market,side,pnl_cad,confidence,reason,created_at")
-    return rows if isinstance(rows, list) else []
+    """Trades for learning. Live mode ignores paper trades completely."""
+    fetch = limit * 5 if LIVE_TRADING else limit
+    rows = supa_get("trades", f"user_id=eq.{user_id}&order=created_at.desc&limit={fetch}&select=market,side,pnl_cad,confidence,reason,created_at")
+    rows = rows if isinstance(rows, list) else []
+    if LIVE_TRADING:
+        rows = [r for r in rows if str(r.get("reason") or "").startswith("[LIVE]")][:limit]
+    return rows
+
+def get_live_pnl_today(user_id):
+    """Real P&L from today's closed live trades (survives restarts)"""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    rows = supa_get("trades", f"user_id=eq.{user_id}&created_at=gte.{today}T00:00:00Z&select=pnl_cad,reason")
+    rows = rows if isinstance(rows, list) else []
+    return sum(float(r.get("pnl_cad") or 0) for r in rows if str(r.get("reason") or "").startswith("[LIVE]"))
+
+def get_live_account_value(user_id, prices):
+    """Real USDC on Coinbase + current value of open positions"""
+    usdc = get_coinbase_balance()
+    if usdc is None:
+        return None, None
+    held = 0.0
+    for pos in get_open_positions(user_id):
+        price = float(prices.get(pos.get("market"), 0) or 0)
+        held += float(pos.get("amount_coin", 0) or 0) * price
+    return usdc, usdc + held
 
 def save_insights(user_id, insights):
     """Save learning insights to Supabase so they persist across restarts"""
@@ -534,7 +558,7 @@ def save_insights(user_id, insights):
             f"{SUPABASE_URL}/rest/v1/learning_insights",
             json={
                 "user_id": user_id,
-                "insight_key": "main",
+                "insight_key": INSIGHT_KEY,
                 "insight_data": insights,
                 "updated_at": datetime.now(timezone.utc).isoformat()
             },
@@ -552,7 +576,7 @@ def save_insights(user_id, insights):
 def load_insights(user_id):
     """Load previously saved insights from Supabase"""
     try:
-        rows = supa_get("learning_insights", f"user_id=eq.{user_id}&insight_key=eq.main&select=insight_data")
+        rows = supa_get("learning_insights", f"user_id=eq.{user_id}&insight_key=eq.{INSIGHT_KEY}&select=insight_data")
         if rows and len(rows) > 0:
             return rows[0].get("insight_data", {})
         return {}
@@ -948,6 +972,14 @@ def check_and_close_positions(user_id, prices):
             closed += 1
 
             close_live_position(pos_id, exit_reason)
+            meta = open_trade_meta.pop((user_id, market), {})
+            supa_post("trades", {
+                "user_id": user_id, "market": market, "side": "long",
+                "price": f"${current_price:.4f}", "size_cad": round(size_usdc, 4),
+                "leverage": 1, "pnl_cad": net_pnl,
+                "confidence": meta.get("confidence", "medium"),
+                "reason": f"[LIVE] {meta.get('reason', '')} · {exit_reason}"
+            })
             supa_post("alerts", {
                 "user_id": user_id,
                 "type": "win" if net_pnl > 0 else "loss",
@@ -982,8 +1014,8 @@ def execute_trade(user_id, market, side, size_cad, leverage, confidence, balance
             log(f"  {market} not in Coinbase pairs — skipping")
             return None, None, None, "market not on Coinbase"
 
-        # Use USDC size directly
-        size_usdc = size_cad * 0.72
+        # Live balance is real USDC, so size is already USDC
+        size_usdc = size_cad
         log(f"  💵 LIVE BUY: {product_id} ${size_usdc:.2f} USDC")
         order = place_coinbase_order(product_id, "long", size_usdc)
 
@@ -1094,21 +1126,42 @@ def scan_for_user(user, prices, do_learning):
 
     if not bot_enabled:
         log(f"  User {user_id[:8]}... paused")
+        if LIVE_TRADING:
+            check_and_close_positions(user_id, prices)   # never leave a real position unmanaged
         return
 
-    # Hard stop
-    if balance <= HARD_STOP_BALANCE:
-        log(f"  ⛔ HARD STOP — ${balance:.2f} CAD")
+    live_paused_today = False
+    account_value = None
+    if LIVE_TRADING:
+        usdc, account_value = get_live_account_value(user_id, prices)
+        if usdc is None:
+            log("  ⚠️ Couldn't read Coinbase balance — skipping this scan")
+            return
+        balance = usdc
+        log(f"  💼 Account: ${account_value:.2f} USDC total (${usdc:.2f} free)")
+
+        # Daily loss from real closed trades — resumes by itself tomorrow
+        today_pnl = get_live_pnl_today(user_id)
+        if today_pnl <= -MAX_DAILY_LOSS_CAD:
+            live_paused_today = True
+            log(f"  🛑 Daily loss ${abs(today_pnl):.2f} hit — no new buys until tomorrow (still managing open positions)")
+
+    # Hard stop (live = real total account value incl. open positions)
+    stop_value = account_value if LIVE_TRADING else balance
+    if stop_value <= HARD_STOP_BALANCE:
+        if LIVE_TRADING:
+            check_and_close_positions(user_id, prices)   # still exit open positions on TP/SL
+        log(f"  ⛔ HARD STOP — ${stop_value:.2f}")
         supa_post("alerts", {"user_id": user_id, "type": "warn",
             "title": "⛔ Hard stop triggered!",
-            "description": f"Balance ${balance:.2f} CAD — bot paused."})
+            "description": f"Balance ${stop_value:.2f} — bot paused."})
         requests.patch(f"{SUPABASE_URL}/rest/v1/bot_settings?user_id=eq.{user_id}",
             json={"bot_enabled": False, "updated_at": datetime.now(timezone.utc).isoformat()},
             headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                      "Content-Type": "application/json", "Prefer": "return=minimal"})
         return
 
-    if balance < 5:
+    if balance < 5 and not LIVE_TRADING:
         log(f"  Balance too low")
         return
 
@@ -1150,16 +1203,27 @@ def scan_for_user(user, prices, do_learning):
             total_pnl += pos_pnl
             log(f"  Closed {pos_closed} position(s) | P&L: {'+' if pos_pnl >= 0 else ''}${pos_pnl:.4f} | Balance: ${balance:.2f}")
 
+    if LIVE_TRADING and live_paused_today:
+        save_settings(user_id, (account_value if LIVE_TRADING and account_value is not None else balance), total_pnl, trade_count, trade_size_pct, leverage, risk)
+        return
+
+    if LIVE_TRADING and balance < 5:
+        log(f"  Free USDC too low (${balance:.2f}) — waiting")
+        save_settings(user_id, (account_value if LIVE_TRADING and account_value is not None else balance), total_pnl, trade_count, trade_size_pct, leverage, risk)
+        return
+
     # Don't open new position if we already have one open
     if LIVE_TRADING:
         open_pos = get_open_positions(user_id)
         if open_pos:
             log(f"  ⏳ {len(open_pos)} position(s) open — waiting for exit before new trade")
-            save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leverage, risk)
+            save_settings(user_id, (account_value if LIVE_TRADING and account_value is not None else balance), total_pnl, trade_count, trade_size_pct, leverage, risk)
             return
 
     # Select markets
     available = [m for m in MARKETS if m in prices]
+    if LIVE_TRADING:
+        available = [m for m in available if m in COINBASE_PAIRS]  # only coins we can actually buy
     if not available:
         return
 
@@ -1209,7 +1273,7 @@ def scan_for_user(user, prices, do_learning):
         fg_context = f"\nMarket sentiment: {fg_str}" if fg_str else ""
         full_context = learning_context + fg_context
 
-        decision = call_claude(market, price_str, risk, leverage, market_data, full_context, funding, orderbook)
+        decision = call_claude(market, price_str, risk, 1 if LIVE_TRADING else leverage, market_data, full_context, funding, orderbook)
 
         if decision.get("trade") and not traded_this_scan:
             side = decision.get("side", "long")
@@ -1222,6 +1286,19 @@ def scan_for_user(user, prices, do_learning):
 
             if pnl is None:
                 log(f"    {market} SKIP — {order_status}")
+                continue
+
+            if LIVE_TRADING:
+                # Real buy opened — result gets recorded when it sells, not now
+                traded_this_scan = True
+                open_trade_meta[(user_id, market)] = {"confidence": confidence, "reason": decision.get("reason", "")}
+                supa_post("alerts", {
+                    "user_id": user_id, "type": "win",
+                    "title": f"🔴 LIVE {market} BOUGHT",
+                    "description": f"${size_cad:.2f} USDC @ {price_str} · {confidence} confidence · {decision.get('reason','')[:120]}"
+                })
+                balance = max(0, balance - size_cad)
+                trade_count += 1
                 continue
 
             won = pnl > 0
@@ -1264,7 +1341,7 @@ def scan_for_user(user, prices, do_learning):
         else:
             log(f"    {market} SKIP — {decision.get('reason','no signal')[:60]}")
 
-    save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leverage, risk)
+    save_settings(user_id, (account_value if LIVE_TRADING and account_value is not None else balance), total_pnl, trade_count, trade_size_pct, leverage, risk)
 
 # ---- MAIN ----
 def main():
@@ -1298,7 +1375,7 @@ def main():
                     # Update COINBASE_PAIRS to only use available pairs
                     global COINBASE_PAIRS
                     COINBASE_PAIRS = {}
-                    for coin in ["BTC","ETH","SOL","AVAX","LINK","DOGE","ADA","LTC","XRP","BNB"]:
+                    for coin in MARKETS:
                         if f"{coin}-USDC" in cad_pairs:
                             COINBASE_PAIRS[coin] = f"{coin}-USDC"
                     log(f"   Configured pairs: {list(COINBASE_PAIRS.keys())}")
