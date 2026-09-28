@@ -57,6 +57,9 @@ LIVE_SIZE_PCT = {"medium": 10, "high": 20}   # % of free USDC per trade by confi
 LIMIT_BUY_WAIT = 60         # seconds to wait for a limit buy to fill before cancelling
 HARD_STOP_BALANCE = 35.0    # stop if balance drops below $35 (50% of starting USDC)
 MARKETS_PER_SCAN = 3
+FULL_SCAN_EVERY = int(os.environ.get("FULL_SCAN_EVERY", "4"))   # look for new buys every 4th loop (~12 min); positions checked every loop
+MIN_PREFILTER_SIGNALS = 2   # coin needs this many free bullish signals before we pay to ask Claude
+MAX_CLAUDE_CALLS = 3        # max coins sent to Claude per full scan
 FORCE_CLOSE_ON_START = os.environ.get("FORCE_CLOSE_ON_START", "false").lower() == "true"  # sells all open positions once per boot
 _force_closed_users = set()
 INSIGHT_KEY = "live" if LIVE_TRADING else "main"   # live learning never mixes with paper learning
@@ -1285,8 +1288,21 @@ def get_trade_size(base_pct, confidence, balance, market_data=None, fear_greed=N
     pct = max(3, min(pct, 30))  # hard limits: 3% min, 30% max
     return balance * (pct / 100)
 
+# ---- FREE PRE-FILTER (no Claude cost) ----
+def prefilter_signals(md, fear_greed=None):
+    """Count simple bullish signals using the same rules Claude is given"""
+    if not md:
+        return 0, []
+    hits = []
+    if md["rsi"] < 45: hits.append(f"RSI {md['rsi']}")
+    if md["price_position_pct"] < 30: hits.append("near 24h low")
+    if md["volume_ratio"] > 1.0: hits.append(f"vol {md['volume_ratio']}x")
+    if md["above_sma5"] and md["above_sma10"]: hits.append("uptrend")
+    if fear_greed and fear_greed.get("value") and fear_greed["value"] < 40: hits.append("fear")
+    return len(hits), hits
+
 # ---- SCAN FOR ONE USER ----
-def scan_for_user(user, prices, do_learning):
+def scan_for_user(user, prices, do_learning, full_scan=True):
     global user_learning
     user_id = user["user_id"]
     balance = float(user.get("balance_cad") or START_CAD)
@@ -1393,6 +1409,12 @@ def scan_for_user(user, prices, do_learning):
             save_settings(user_id, (account_value if LIVE_TRADING and account_value is not None else balance), total_pnl, trade_count, trade_size_pct, leverage, risk)
             return
 
+    # Between full scans: only manage positions (free), don't look for buys
+    if not full_scan:
+        log(f"  ✓ Positions checked — next buy search in a few min")
+        save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leverage, risk)
+        return
+
     # Select markets
     available = [m for m in MARKETS if m in prices]
     if LIVE_TRADING:
@@ -1408,14 +1430,6 @@ def scan_for_user(user, prices, do_learning):
         if analysis and analysis["best_markets"]:
             good_markets = [m for m in analysis["best_markets"] if m in available]
 
-    selected = []
-    if good_markets:
-        selected += random.sample(good_markets, min(2, len(good_markets)))
-    remaining = [m for m in available if m not in selected]
-    needed = MARKETS_PER_SCAN - len(selected)
-    if remaining and needed > 0:
-        selected += random.sample(remaining, min(needed, len(remaining)))
-
     mode_tag = "🔴 LIVE" if LIVE_TRADING else "📄 PAPER"
 
     # Fetch fear & greed index once per scan (cached hourly)
@@ -1424,7 +1438,24 @@ def scan_for_user(user, prices, do_learning):
     if fg_str:
         log(f"  {fg_str}")
 
-    log(f"  {mode_tag} | User {user_id[:8]}... scanning: {', '.join(selected)}")
+    # Free check on EVERY tradable coin, only the best go to Claude
+    md_cache = {}
+    ranked = []
+    for m in available:
+        md = fetch_market_data(m)
+        md_cache[m] = md
+        n, hits = prefilter_signals(md, fear_greed)
+        if n >= MIN_PREFILTER_SIGNALS:
+            ranked.append((n, m in good_markets, m, hits))
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    selected = [m for _, _, m, _ in ranked[:MAX_CLAUDE_CALLS]]
+
+    if not selected:
+        log(f"  {mode_tag} | Checked {len(available)} coins for free — nothing interesting, no Claude calls")
+        save_settings(user_id, balance, total_pnl, trade_count, trade_size_pct, leverage, risk)
+        return
+    log(f"  {mode_tag} | Checked {len(available)} coins for free — asking Claude about: "
+        + ", ".join(f"{m} ({', '.join(h)})" for _, _, m, h in ranked[:MAX_CLAUDE_CALLS]))
 
     traded_this_scan = False
     for market in selected:
@@ -1434,7 +1465,7 @@ def scan_for_user(user, prices, do_learning):
         price_str = f"${price:,.0f}" if price > 1000 else f"${price:.2f}"
         log(f"    {market} @ {price_str}")
 
-        market_data = fetch_market_data(market)
+        market_data = md_cache.get(market) or fetch_market_data(market)
         funding = fetch_funding_rate(market)
         orderbook = fetch_orderbook(market)
 
@@ -1523,7 +1554,7 @@ def main():
     log(f"   Mode: {'🔴 LIVE TRADING — REAL MONEY' if LIVE_TRADING else '📄 PAPER TRADING'}")
     log(f"   Supabase: {SUPABASE_URL}")
     log(f"   Claude AI: {'ENABLED ✓' if ANTHROPIC_KEY else 'fallback'}")
-    log(f"   Scan: {SCAN_INTERVAL}s | Markets per scan: {MARKETS_PER_SCAN} of {len(MARKETS)}")
+    log(f"   Position check: every {SCAN_INTERVAL}s | Buy search: every {SCAN_INTERVAL*FULL_SCAN_EVERY//60} min | Claude only when {MIN_PREFILTER_SIGNALS}+ free signals")
     log(f"   Fee: {TRADING_FEE*100:.2f}% | Slippage: {SLIPPAGE*100:.1f}%")
     log(f"   SL: {STOP_LOSS_PCT*100:.1f}% | Trailing stop from +{TAKE_PROFIT_PCT*100:.1f}% ({TRAIL_GAP_PCT*100:.1f}% gap) | Hard stop: ${HARD_STOP_BALANCE}")
     log(f"   Max daily loss: ${MAX_DAILY_LOSS_CAD} {'USDC' if LIVE_TRADING else 'CAD'}")
@@ -1597,7 +1628,7 @@ def main():
 
             for user in active:
                 try:
-                    scan_for_user(user, prices, do_learning)
+                    scan_for_user(user, prices, do_learning, full_scan=(scan_counter % FULL_SCAN_EVERY == 1 or FULL_SCAN_EVERY <= 1))
                     if do_weekly:
                         send_weekly_report(user["user_id"])
                 except Exception as e:
